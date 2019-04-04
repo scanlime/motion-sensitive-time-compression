@@ -34,7 +34,7 @@ int main(int argc, char **argv)
 	cv::String outputFile = "F:/recording/summary-" + timestamp() + ".avi";
 	const double fps = 30.0;
 	unsigned fourcc = cv::VideoWriter::fourcc('H', '2', '6', '4');
-	const double threshold = atof(argc >= 3 ? argv[2] : "0.018");
+	const double threshold = atof(argc >= 3 ? argv[2] : "100");
 
 	std::cout << "threshold = " << threshold << "\n";
 
@@ -61,13 +61,12 @@ int main(int argc, char **argv)
 	unsigned min_accumulated_frames = 1;
 
 	cv::cuda::Stream stream;
-	cv::Ptr<cv::cuda::DenseOpticalFlow> flow_algorithm = cv::cuda::FarnebackOpticalFlow::create();
+	cv::Ptr<cv::cuda::DenseOpticalFlow> flow_algorithm = cv::cuda::DensePyrLKOpticalFlow::create(cv::Size(5, 5), 3, 10);
 
 	cv::cuda::GpuMat accumulator(format.height, format.width, CV_32SC4);
 	cv::cuda::GpuMat next_accumulator(format.height, format.width, CV_32SC4);
-	cv::cuda::GpuMat gray, last_gray;
 	cv::cuda::GpuMat flowvec, flowvec_mag, flowvec_pyr;
-	cv::cuda::GpuMat rgbx, rgbx_pyr;
+	cv::cuda::GpuMat rgbx, gray, last_gray;
 	cv::cuda::GpuMat frame;
 	cv::cuda::GpuMat wide_frame;
 		
@@ -100,14 +99,15 @@ int main(int argc, char **argv)
 				// Limit how quickly the number of frames averaged can decrease.
 				// Sometimes we may want to be examining single frames, but often we want
 				// to reduce outliers and noise by averaging several frames.
-				min_accumulated_frames = std::max<unsigned>(1, accumulated_frames / 2);
+				// We can also go faster if we skip optical flow frames.
+
+				min_accumulated_frames = std::max<unsigned>(1, accumulated_frames * 0.75);
 
 				// Scaled RGB image
 				accumulator.convertTo(rgbx, CV_8UC4, 1.0 / accumulated_frames, 0.0, stream);
 
-				// Low-resolution grayscale version for optical flow
-				cv::cuda::pyrDown(rgbx, rgbx_pyr, stream);
-				cv::cuda::cvtColor(rgbx_pyr, gray, cv::COLOR_BGRA2GRAY, 0, stream);
+				// Grayscale version for optical flow
+				cv::cuda::cvtColor(rgbx, gray, cv::COLOR_BGRA2GRAY, 0, stream);
 
 				if (last_gray.empty()) {
 					// No reference image yet
