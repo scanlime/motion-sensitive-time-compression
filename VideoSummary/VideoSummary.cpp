@@ -25,13 +25,16 @@ cv::String timestamp()
 
 int main(int argc, char **argv)
 {
-	std::cout << "VideoSummary\n";
+	if (argc < 2) {
+		std::cout << "usage: VideoSummary input_file [threshold]\n";
+		return 1;
+	}
 
-	cv::String inputFile = argc >= 2 ? argv[1] : "F:/eyesopod_1/rec/2019-03-27_15-37-47.mkv";
+	cv::String inputFile = argv[1];
 	cv::String outputFile = "F:/recording/summary-" + timestamp() + ".avi";
 	const double fps = 30.0;
-	unsigned fourcc = cv::VideoWriter::fourcc('F', 'F', 'V', 'H');
-	const double threshold = atof(argc >= 3 ? argv[2] : "0.05");
+	unsigned fourcc = cv::VideoWriter::fourcc('H', '2', '6', '4');
+	const double threshold = atof(argc >= 3 ? argv[2] : "0.018");
 
 	std::cout << "threshold = " << threshold << "\n";
 
@@ -39,8 +42,17 @@ int main(int argc, char **argv)
 	cv::cudacodec::FormatInfo format = input->format();
     std::cout << "Input ok!\n" << inputFile << ", " << format.width << " x " << format.height << "\n"; 
 
-	cv::VideoWriter output(outputFile, fourcc, fps, cv::Size(format.width, format.height));
-	std::cout << "Writing " << outputFile << "\n";
+	// Workaround what seems to be a cv::cudacodec bug, where the format does not distinguish
+	// between frame size and buffer size. I'm usually running this on 1080p video, which h264
+	// will store as 1920x1088 internally. We see this size instead of the file's true size
+	// of 1920x1080. This fixes the one particular case only.
+	cv::Size output_size = cv::Size(format.width, format.height);
+	if (output_size == cv::Size(1920, 1088)) {
+		output_size.height = 1080;
+	}
+
+	std::cout << "Writing " << outputFile << " as " << output_size.width << " x " << output_size.height << "\n";
+	cv::VideoWriter output(outputFile, fourcc, fps, output_size);
 
 	bool eof = false;
 	unsigned input_frames = 0;
@@ -54,9 +66,8 @@ int main(int argc, char **argv)
 	cv::cuda::GpuMat accumulator(format.height, format.width, CV_32SC4);
 	cv::cuda::GpuMat next_accumulator(format.height, format.width, CV_32SC4);
 	cv::cuda::GpuMat gray, last_gray;
-	cv::cuda::GpuMat pyr[2];
 	cv::cuda::GpuMat flowvec, flowvec_mag, flowvec_pyr;
-	cv::cuda::GpuMat rgbx;
+	cv::cuda::GpuMat rgbx, rgbx_pyr;
 	cv::cuda::GpuMat frame;
 	cv::cuda::GpuMat wide_frame;
 		
@@ -95,9 +106,8 @@ int main(int argc, char **argv)
 				accumulator.convertTo(rgbx, CV_8UC4, 1.0 / accumulated_frames, 0.0, stream);
 
 				// Low-resolution grayscale version for optical flow
-				cv::cuda::pyrDown(rgbx, pyr[0], stream);
-				cv::cuda::pyrDown(pyr[0], pyr[1], stream);
-				cv::cuda::cvtColor(pyr[1], gray, cv::COLOR_BGRA2GRAY, 0, stream);
+				cv::cuda::pyrDown(rgbx, rgbx_pyr, stream);
+				cv::cuda::cvtColor(rgbx_pyr, gray, cv::COLOR_BGRA2GRAY, 0, stream);
 
 				if (last_gray.empty()) {
 					// No reference image yet
@@ -110,7 +120,7 @@ int main(int argc, char **argv)
 					cv::cuda::magnitude(flowvec, flowvec_mag, stream);
 					cv::cuda::pyrDown(flowvec_mag, flowvec_pyr, stream);
 
-					cv::Scalar sum4 = cv::cuda::absSum(flowvec_pyr);
+					cv::Scalar sum4 = cv::cuda::sqrSum(flowvec_pyr);
 					sum = sum4.val[0] / flowvec_pyr.size().area();
 				}
 			}
@@ -130,6 +140,7 @@ int main(int argc, char **argv)
 			sys_rgbx_done[!this_buffer].waitForCompletion();
 			cv::Mat rgb;
 			cv::cvtColor(sys_rgbx[!this_buffer], rgb, cv::COLOR_BGRA2BGR);
+			rgb.adjustROI(0, output_size.height - rgb.rows, 0, output_size.width - rgb.cols);
 			output.write(rgb);
 		}
 		output_frames++;
