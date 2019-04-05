@@ -34,8 +34,13 @@ int main(int argc, char **argv)
 	cv::String outputFile = "F:/recording/summary-" + timestamp() + ".avi";
 	const double fps = 30.0;
 	unsigned fourcc = cv::VideoWriter::fourcc('H', '2', '6', '4');
-	const double threshold = atof(argc >= 3 ? argv[2] : "100");
+	const double threshold = atof(argc >= 3 ? argv[2] : "0");
 
+	const int flow_crop_left = 32, flow_crop_right = 32;
+	const int flow_crop_top = 96, flow_crop_bottom = 64;
+
+	// Default threshold is zero, which skips no frames (for inspecting motion values).
+	// When zero or negative, debug mode is active.
 	std::cout << "threshold = " << threshold << "\n";
 
 	cv::Ptr<cv::cudacodec::VideoReader> input = cv::cudacodec::createVideoReader(inputFile);
@@ -61,15 +66,15 @@ int main(int argc, char **argv)
 	unsigned min_accumulated_frames = 1;
 
 	cv::cuda::Stream stream;
-	cv::Ptr<cv::cuda::DenseOpticalFlow> flow_algorithm = cv::cuda::DensePyrLKOpticalFlow::create(cv::Size(5, 5), 3, 10);
+	cv::Ptr<cv::cuda::DenseOpticalFlow> flow_algorithm = cv::cuda::FarnebackOpticalFlow::create(3, 0.5, true, 13, 20);
 
 	cv::cuda::GpuMat accumulator(format.height, format.width, CV_32SC4);
 	cv::cuda::GpuMat next_accumulator(format.height, format.width, CV_32SC4);
-	cv::cuda::GpuMat flowvec, flowvec_mag, flowvec_pyr;
-	cv::cuda::GpuMat rgbx, gray, last_gray;
+	cv::cuda::GpuMat flowvec, flowvec_mag;
+	cv::cuda::GpuMat rgbx, gray_pyr[3], gray_flow, last_gray_flow;
 	cv::cuda::GpuMat frame;
 	cv::cuda::GpuMat wide_frame;
-		
+
 	cv::Mat sys_rgbx[2] = { 
 		cv::Mat(format.height, format.width, CV_8UC4),
 		cv::Mat(format.height, format.width, CV_8UC4)
@@ -78,7 +83,7 @@ int main(int argc, char **argv)
 
 	while (!eof) {
 		// Reset accumulation at startup and after each output frame
-		double sum = 0;
+		double motion = 0;
 		accumulator.setTo(0.0, cv::noArray(), stream);
 		accumulated_frames = 0;
 
@@ -107,28 +112,28 @@ int main(int argc, char **argv)
 				accumulator.convertTo(rgbx, CV_8UC4, 1.0 / accumulated_frames, 0.0, stream);
 
 				// Grayscale version for optical flow
-				cv::cuda::cvtColor(rgbx, gray, cv::COLOR_BGRA2GRAY, 0, stream);
+				cv::cuda::cvtColor(rgbx, gray_pyr[0], cv::COLOR_BGRA2GRAY, 0, stream);
+				cv::cuda::pyrDown(gray_pyr[0], gray_pyr[1], stream);
+				gray_pyr[1].convertTo(gray_flow, CV_32FC1, stream);
 
-				if (last_gray.empty()) {
+				if (last_gray_flow.empty()) {
 					// No reference image yet
-					sum = threshold;
+					motion = fabs(threshold);
 					break;
 				}
 				else {
-					// Optical flow vs reference
-					flow_algorithm->calc(last_gray, gray, flowvec, stream);
+					// Peak filtered optical flow vs reference
+					flow_algorithm->calc(last_gray_flow, gray_flow, flowvec, stream);
+					flowvec.adjustROI(-flow_crop_top, -flow_crop_bottom, -flow_crop_left, -flow_crop_right);
 					cv::cuda::magnitude(flowvec, flowvec_mag, stream);
-					cv::cuda::pyrDown(flowvec_mag, flowvec_pyr, stream);
-
-					cv::Scalar sum4 = cv::cuda::sqrSum(flowvec_pyr);
-					sum = sum4.val[0] / flowvec_pyr.size().area();
+					motion = cv::cuda::sqrSum(flowvec_mag).val[0] / (double)flowvec_mag.size().area();
 				}
 			}
 
-		} while (sum < threshold && !eof);
+		} while (threshold != 0.0 && motion < fabs(threshold) && !eof);
 
 		// Save reference frame
-		gray.copyTo(last_gray, stream);
+		gray_flow.copyTo(last_gray_flow, stream);
 
 		// Async download
 		unsigned this_buffer = output_frames % 2;
@@ -138,14 +143,25 @@ int main(int argc, char **argv)
 		if (output_frames > 0) {
 			// Complete the previous frame on the CPU side, hopefully without blocking
 			sys_rgbx_done[!this_buffer].waitForCompletion();
+			cv::Mat &rgbx = sys_rgbx[!this_buffer];
+
+			if (threshold <= 0.0 && !flowvec.empty()) {
+				// Debug mode; draw the calculated optical flow
+				cv::cuda::GpuMat gpu_flow_gray, gpu_flow_rgbx;
+				cv::cuda::normalize(flowvec_mag, gpu_flow_gray, 0, 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
+				cv::cuda::cvtColor(gpu_flow_gray, gpu_flow_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
+				cv::Mat cpu_flow(gpu_flow_rgbx);
+				cpu_flow.copyTo(rgbx(cv::Rect(cv::Point(flow_crop_left, flow_crop_top), cpu_flow.size())));
+			}
+
 			cv::Mat rgb;
-			cv::cvtColor(sys_rgbx[!this_buffer], rgb, cv::COLOR_BGRA2BGR);
+			cv::cvtColor(rgbx, rgb, cv::COLOR_BGRA2BGR);
 			rgb.adjustROI(0, output_size.height - rgb.rows, 0, output_size.width - rgb.cols);
 			output.write(rgb);
 		}
 		output_frames++;
 
-		std::cout << "sum= " << sum << ", " << input_frames << "/" << output_frames << ", accum " << accumulated_frames << "\n";
+		std::cout << " " << output_frames << "/" << input_frames << " x" << accumulated_frames << " ~" << motion << "\n";
 	}
 
 	std::cout << "done.\n";
