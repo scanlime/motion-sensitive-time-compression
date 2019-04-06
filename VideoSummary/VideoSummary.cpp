@@ -82,7 +82,7 @@ int main(int argc, char **argv)
 	cv::cuda::GpuMat flowvec_masked(format.height, format.width, CV_32FC1);
 
 	cv::cuda::GpuMat flowvec_norm, flowvec_rgbx;
-	cv::cuda::GpuMat rgbx, gray_unmasked, gray, last_gray;
+	cv::cuda::GpuMat rgbx, gray_unmasked, gray, reference_gray;
 	cv::cuda::GpuMat frame, wide_frame;
 	cv::cuda::GpuMat fgmask, fgmask_rgbx, fgmask_eroded;
 
@@ -99,8 +99,6 @@ int main(int argc, char **argv)
 		accumulated_frames = 0;
 
 		while (!eof) {
-			gray.swap(last_gray);
-
 			if (!input->nextFrame(frame)) {
 				// No more frames in input, but let the current accumulated output frame finish
 				eof = true;
@@ -124,35 +122,39 @@ int main(int argc, char **argv)
 
 				// Grayscale image for optical flow
 				cv::cuda::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY, 0, stream);
-			}
 
-			if (!last_gray.empty()) {
-				// Calculate optical flow on each grayscale frame pair
-				flow_algorithm->calc(last_gray, gray, flowvec, stream);
-			}
+				if (reference_gray.empty()) {
+					gray.copyTo(reference_gray, stream);
+				}
+				else {
+					// Calculate optical flow on each grayscale frame pair
+					flow_algorithm->calc(reference_gray, gray, flowvec, stream);
 
-			if (accumulated_frames >= 1 && !flowvec.empty()) {
-				// Scaled RGB image
-				accumulator.convertTo(rgbx, CV_8UC4, 1.0 / accumulated_frames, 0.0, stream);
+					// Masked flow magnitudes
+					cv::cuda::magnitude(flowvec, flowvec_mag, stream);
+					flowvec_masked.setTo(cv::Scalar(0.0), cv::noArray(), stream);
+					flowvec_mag.copyTo(flowvec_masked, fgmask_eroded, stream);
 
-				// Masked flow magnitudes
-				cv::cuda::magnitude(flowvec, flowvec_mag, stream);
-				flowvec_masked.setTo(cv::Scalar(0.0), cv::noArray(), stream);
-				flowvec_mag.copyTo(flowvec_masked, fgmask_eroded, stream);
-
-				// Motion region excluding cropped edges
-				cv::cuda::GpuMat motion_region = flowvec_masked(cv::Rect(
+					// Motion region excluding cropped edges
+					cv::cuda::GpuMat motion_region = flowvec_masked(cv::Rect(
 						flow_crop_left, flow_crop_top,
 						flowvec_masked.cols - flow_crop_left - flow_crop_right,
 						flowvec_masked.rows - flow_crop_top - flow_crop_bottom));
 
-				// Motion total is average of values squared
-				motion = cv::cuda::sqrSum(motion_region).val[0] / (double)motion_region.size().area();
-				if (motion >= threshold) {
-					break;
+					// Motion total is average of values squared
+					motion = cv::cuda::sqrSum(motion_region).val[0] / (double)motion_region.size().area();
+					if (motion >= threshold) {
+						break;
+					}
 				}
 			}
 		}
+
+		// Update motion reference frame
+		gray.copyTo(reference_gray, stream);
+
+		// Scaled RGB image
+		accumulator.convertTo(rgbx, CV_8UC4, 1.0 / accumulated_frames, 0.0, stream);
 
 		// Visualization of the current foreground mask
 		cv::cuda::cvtColor(fgmask, fgmask_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
@@ -160,9 +162,6 @@ int main(int argc, char **argv)
 		// Visualize flow magnitude
 		cv::cuda::normalize(flowvec_masked, flowvec_norm, 0, 3*255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
 		cv::cuda::cvtColor(flowvec_norm, flowvec_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
-
-		// Save reference frame
-		gray.copyTo(last_gray, stream);
 
 		// Paste together output frame
 		output_frame.setTo(cv::Scalar(0.0), stream);
