@@ -27,36 +27,4 @@
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
-  <ItemGroup>
-    <Library Include="..\..\..\..\..\..\..\opencv\build\install\x64\vc15\lib\opencv_core410.lib">
-      <Filter>Source Files</Filter>
-    </Library>
-    <Library Include="..\..\..\..\..\..\..\opencv\build\install\x64\vc15\lib\opencv_cudaarithm410.lib">
-      <Filter>Source Files</Filter>
-    </Library>
-    <Library Include="..\..\..\..\..\..\..\opencv\build\install\x64\vc15\lib\opencv_cudacodec410.lib">
-      <Filter>Source Files</Filter>
-    </Library>
-    <Library Include="..\..\..\..\..\..\..\opencv\build\install\x64\vc15\lib\opencv_cudafilters410.lib">
-      <Filter>Source Files</Filter>
-    </Library>
-    <Library Include="..\..\..\..\..\..\..\opencv\build\install\x64\vc15\lib\opencv_cudaimgproc410.lib">
-      <Filter>Source Files</Filter>
-    </Library>
-    <Library Include="..\..\..\..\..\..\..\opencv\build\install\x64\vc15\lib\opencv_cudev410.lib">
-      <Filter>Source Files</Filter>
-    </Library>
-    <Library Include="..\..\..\..\..\..\..\opencv\build\install\x64\vc15\lib\opencv_imgproc410.lib">
-      <Filter>Source Files</Filter>
-    </Library>
-    <Library Include="..\..\..\..\..\..\..\opencv\build\install\x64\vc15\lib\opencv_videoio410.lib">
-      <Filter>Source Files</Filter>
-    </Library>
-    <Library Include="..\..\..\..\..\..\..\opencv\build\install\x64\vc15\lib\opencv_cudaoptflow410.lib">
-      <Filter>Source Files</Filter>
-    </Library>
-    <Library Include="..\..\..\..\..\..\..\opencv\build\install\x64\vc15\lib\opencv_cudawarping410.lib">
-      <Filter>Source Files</Filter>
-    </Library>
-  </ItemGroup>
 </Project>
