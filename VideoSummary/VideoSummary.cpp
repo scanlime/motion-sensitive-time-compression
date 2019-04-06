@@ -83,7 +83,8 @@ int main(int argc, char **argv)
 
 	cv::cuda::GpuMat flowvec_norm, flowvec_rgbx;
 	cv::cuda::GpuMat rgbx, gray_unmasked, gray, last_gray;
-	cv::cuda::GpuMat frame, wide_frame, fgmask, fgmask_rgbx, fgmask_eroded;
+	cv::cuda::GpuMat frame, wide_frame;
+	cv::cuda::GpuMat fgmask, fgmask_rgbx, fgmask_eroded;
 
 	cv::Mat output_buffers[2] = { 
 		cv::Mat(format.height, format.width, CV_8UC4),
@@ -98,53 +99,55 @@ int main(int argc, char **argv)
 		accumulated_frames = 0;
 
 		while (!eof) {
+			gray.swap(last_gray);
+
 			if (!input->nextFrame(frame)) {
 				// No more frames in input, but let the current accumulated output frame finish
 				eof = true;
-			} else {
-				// Accumulate 32-bit-per-channel input frames, for variable rate frame averaging
+			}
+			else {
 				input_frames++;
+			}
+
+			if (!frame.empty()) {
+				// Accumulate 32-bit-per-channel input frames, for variable rate frame averaging
 				frame.convertTo(wide_frame, CV_32SC4, stream);
 				cv::cuda::add(accumulator, wide_frame, next_accumulator, cv::noArray(), CV_32SC4, stream);
 				accumulator.swap(next_accumulator);
 				accumulated_frames++;
 
 				// Update a background subtractor model with the original-rate video
-				bg_algorithm->apply(frame, fgmask);
-			}
-
-			if (accumulated_frames >= 1) {
-				// Scaled RGB image
-				accumulator.convertTo(rgbx, CV_8UC4, 1.0 / accumulated_frames, 0.0, stream);
+				bg_algorithm->apply(frame, fgmask, -1, stream);
 
 				// Eroded foreground mask to look for masses of pixels rather than speckles
 				bg_erode->apply(fgmask, fgmask_eroded, stream);
 
 				// Grayscale image for optical flow
-				cv::cuda::cvtColor(rgbx, gray, cv::COLOR_BGRA2GRAY, 0, stream);
+				cv::cuda::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY, 0, stream);
+			}
 
-				if (last_gray.empty()) {
-					// No reference image yet
-					motion = threshold;
-					break;
-				}
-				else {
-					// Optical flow, take magnitude, then mask according to foreground segmentation
-					flow_algorithm->calc(last_gray, gray, flowvec, stream);
-					cv::cuda::magnitude(flowvec, flowvec_mag, stream);
-					flowvec_masked.setTo(cv::Scalar(0.0), cv::noArray(), stream);
-					flowvec_mag.copyTo(flowvec_masked, fgmask_eroded, stream);
+			if (!last_gray.empty()) {
+				// Calculate optical flow on each grayscale frame pair
+				flow_algorithm->calc(last_gray, gray, flowvec, stream);
+			}
 
-					// Motion region excluding cropped edges
-					cv::cuda::GpuMat motion_region = flowvec_masked(cv::Rect(
+			if (accumulated_frames >= 1 && !flowvec.empty()) {
+				// Scaled RGB image
+				accumulator.convertTo(rgbx, CV_8UC4, 1.0 / accumulated_frames, 0.0, stream);
+
+				// Masked flow magnitudes
+				cv::cuda::magnitude(flowvec, flowvec_mag, stream);
+				flowvec_masked.setTo(cv::Scalar(0.0), cv::noArray(), stream);
+				flowvec_mag.copyTo(flowvec_masked, fgmask_eroded, stream);
+
+				// Motion region excluding cropped edges
+				cv::cuda::GpuMat motion_region = flowvec_masked(cv::Rect(
 						flow_crop_left, flow_crop_top,
 						flowvec_masked.cols - flow_crop_left - flow_crop_right,
 						flowvec_masked.rows - flow_crop_top - flow_crop_bottom));
 
-					// Motion total is average of values squared
-					motion = cv::cuda::sqrSum(motion_region).val[0] / (double)motion_region.size().area();
-				}
-
+				// Motion total is average of values squared
+				motion = cv::cuda::sqrSum(motion_region).val[0] / (double)motion_region.size().area();
 				if (motion >= threshold) {
 					break;
 				}
