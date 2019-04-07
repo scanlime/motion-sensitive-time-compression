@@ -9,7 +9,6 @@
 #include <opencv2/cudaoptflow.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/imgproc.hpp>
-#include <opencv2/cudawarping.hpp>
 #include <opencv2/cudabgsegm.hpp>
 #include <opencv2/cudafilters.hpp>
 #include <opencv2/cudev/common.hpp>
@@ -47,10 +46,7 @@ int main(int argc, char **argv)
 	cv::String outputFile = "F:/recording/summary-" + timestamp() + ".avi";
 	const double fps = 30.0;
 	unsigned fourcc = cv::VideoWriter::fourcc('H', '2', '6', '4');
-	const double threshold = atof(argc >= 3 ? argv[2] : "0");
-
-	const int flow_crop_left = 64, flow_crop_right = 64;
-	const int flow_crop_top = 96, flow_crop_bottom = 64;
+	const double threshold = atof(argc >= 3 ? argv[2] : "0.05");
 
 	std::cout << "threshold = " << threshold << "\n";
 
@@ -59,7 +55,7 @@ int main(int argc, char **argv)
     std::cout << "Input ok!\n" << inputFile << ", " << format.width << " x " << format.height << "\n"; 
 
 	// Stacked output images
-	cv::Size output_size = cv::Size(format.width, format.height * 3);
+	cv::Size output_size = cv::Size(format.width, format.height * 4);
 
 	std::cout << "Writing " << outputFile << " as " << output_size.width << " x " << output_size.height << "\n";
 	cv::VideoWriter output(outputFile, fourcc, fps, output_size);
@@ -68,6 +64,8 @@ int main(int argc, char **argv)
 	unsigned input_frames = 0;
 	unsigned output_frames = 0;
 	unsigned accumulated_frames = 0;
+	unsigned rgbx_num_accumulated_frames = 0;
+	double motion = 0;
 
 	cv::cuda::Stream stream;
 	cv::Ptr<cv::cuda::DenseOpticalFlow> flow_algorithm = cv::cuda::DensePyrLKOpticalFlow::create();
@@ -81,7 +79,7 @@ int main(int argc, char **argv)
 	cv::cuda::GpuMat flowvec_mag(format.height, format.width, CV_32FC1);
 	cv::cuda::GpuMat flowvec_masked(format.height, format.width, CV_32FC1);
 
-	cv::cuda::GpuMat flowvec_norm, flowvec_rgbx;
+	cv::cuda::GpuMat flowvec_raw_norm, flowvec_masked_norm, flowvec_raw_rgbx, flowvec_masked_rgbx;
 	cv::cuda::GpuMat rgbx, gray_unmasked, gray, reference_gray;
 	cv::cuda::GpuMat frame, wide_frame;
 	cv::cuda::GpuMat fgmask, fgmask_rgbx, fgmask_eroded;
@@ -92,12 +90,10 @@ int main(int argc, char **argv)
 	};
 	cv::cuda::Event output_events[2];
 
+	// Looping over output frames
 	while (!eof) {
-		// Reset accumulation at startup and after each output frame
-		double motion = 0;
-		accumulator.setTo(0.0, cv::noArray(), stream);
-		accumulated_frames = 0;
 
+		// Looping over input frames
 		while (!eof) {
 			if (!input->nextFrame(frame)) {
 				// No more frames in input, but let the current accumulated output frame finish
@@ -108,12 +104,6 @@ int main(int argc, char **argv)
 			}
 
 			if (!frame.empty()) {
-				// Accumulate 32-bit-per-channel input frames, for variable rate frame averaging
-				frame.convertTo(wide_frame, CV_32SC4, stream);
-				cv::cuda::add(accumulator, wide_frame, next_accumulator, cv::noArray(), CV_32SC4, stream);
-				accumulator.swap(next_accumulator);
-				accumulated_frames++;
-
 				// Update a background subtractor model with the original-rate video
 				bg_algorithm->apply(frame, fgmask, -1, stream);
 
@@ -124,6 +114,7 @@ int main(int argc, char **argv)
 				cv::cuda::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY, 0, stream);
 
 				if (reference_gray.empty()) {
+					// Skip calculating motion threshold for now, set a reference
 					gray.copyTo(reference_gray, stream);
 				}
 				else {
@@ -135,55 +126,73 @@ int main(int argc, char **argv)
 					flowvec_masked.setTo(cv::Scalar(0.0), cv::noArray(), stream);
 					flowvec_mag.copyTo(flowvec_masked, fgmask_eroded, stream);
 
-					// Motion region excluding cropped edges
-					cv::cuda::GpuMat motion_region = flowvec_masked(cv::Rect(
-						flow_crop_left, flow_crop_top,
-						flowvec_masked.cols - flow_crop_left - flow_crop_right,
-						flowvec_masked.rows - flow_crop_top - flow_crop_bottom));
-
 					// Motion total is average of values squared
-					motion = cv::cuda::sqrSum(motion_region).val[0] / (double)motion_region.size().area();
-					if (motion >= threshold) {
-						break;
+					motion = cv::cuda::sqrSum(flowvec_masked).val[0] / (double)flowvec_masked.size().area();
+				}
+
+				if (motion < threshold) {
+					// Not enough motion yet, add this frame to the accumulator
+					frame.convertTo(wide_frame, CV_32SC4, stream);
+					cv::cuda::add(accumulator, wide_frame, next_accumulator, cv::noArray(), CV_32SC4, stream);
+					accumulator.swap(next_accumulator);
+					accumulated_frames++;
+				}
+				else {
+					// This frame exceeds the motion threshold. It will be the new reference frame, and we
+					// will restart the accumulator with this as the first new frame. The old accumulator
+					// is averaged and moved to rgbx.
+
+					if (accumulated_frames >= 1) {
+						accumulator.convertTo(rgbx, CV_8UC4, 1.0 / accumulated_frames, 0.0, stream);
+						rgbx_num_accumulated_frames = accumulated_frames;
 					}
+
+					frame.convertTo(accumulator, CV_32SC4, stream);
+					accumulated_frames = 1;
+
+					// Update motion reference frame
+					gray.copyTo(reference_gray, stream);
+
+					// Output a frame
+					break;
 				}
 			}
 		}
 
-		// Update motion reference frame
-		gray.copyTo(reference_gray, stream);
+		if (!rgbx.empty()) {
 
-		// Scaled RGB image
-		accumulator.convertTo(rgbx, CV_8UC4, 1.0 / accumulated_frames, 0.0, stream);
+			// Visualization of the current foreground mask
+			cv::cuda::cvtColor(fgmask, fgmask_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
 
-		// Visualization of the current foreground mask
-		cv::cuda::cvtColor(fgmask, fgmask_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
+			// Visualize flow magnitude with and without foreground mask
+			cv::cuda::normalize(flowvec_masked, flowvec_masked_norm, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
+			cv::cuda::cvtColor(flowvec_masked_norm, flowvec_masked_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
+			cv::cuda::normalize(flowvec_mag, flowvec_raw_norm, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
+			cv::cuda::cvtColor(flowvec_raw_norm, flowvec_raw_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
 
-		// Visualize flow magnitude
-		cv::cuda::normalize(flowvec_masked, flowvec_norm, 0, 3*255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
-		cv::cuda::cvtColor(flowvec_norm, flowvec_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
+			// Paste together output frame
+			output_frame.setTo(cv::Scalar(0.0), stream);
+			rgbx.copyTo(output_frame.rowRange(format.height * 0, format.height * 1), stream);
+			flowvec_masked_rgbx.copyTo(output_frame.rowRange(format.height * 1, format.height * 2), stream);
+			flowvec_raw_rgbx.copyTo(output_frame.rowRange(format.height * 2, format.height * 3), stream);
+			fgmask_rgbx.copyTo(output_frame.rowRange(format.height * 3, format.height * 4), stream);
 
-		// Paste together output frame
-		output_frame.setTo(cv::Scalar(0.0), stream);
-		if (!rgbx.empty()) rgbx.copyTo(output_frame.rowRange(format.height * 0, format.height * 1), stream);
-		if (!fgmask_rgbx.empty()) fgmask_rgbx.copyTo(output_frame.rowRange(format.height * 1, format.height * 2), stream);
-		if (!flowvec_rgbx.empty()) flowvec_rgbx.copyTo(output_frame.rowRange(format.height * 2, format.height * 3), stream);
+			// Async download
+			unsigned this_buffer = output_frames % 2;
+			output_frame.download(output_buffers[this_buffer], stream);
+			output_events[this_buffer].record(stream);
 
-		// Async download
-		unsigned this_buffer = output_frames % 2;
-		output_frame.download(output_buffers[this_buffer], stream);
-		output_events[this_buffer].record(stream);
+			if (output_frames > 0) {
+				// Complete the previous frame on the CPU side, hopefully without blocking
+				output_events[!this_buffer].waitForCompletion();
+				cv::Mat rgb, &rgbx = output_buffers[!this_buffer];
+				cv::cvtColor(rgbx, rgb, cv::COLOR_BGRA2BGR);
+				output.write(rgb);
+			}
+			output_frames++;
 
-		if (output_frames > 0) {
-			// Complete the previous frame on the CPU side, hopefully without blocking
-			output_events[!this_buffer].waitForCompletion();
-			cv::Mat rgb, &rgbx = output_buffers[!this_buffer];
-			cv::cvtColor(rgbx, rgb, cv::COLOR_BGRA2BGR);
-			output.write(rgb);
+			std::cout << " " << output_frames << "/" << input_frames << " x" << rgbx_num_accumulated_frames << " ~" << motion << "\n";
 		}
-		output_frames++;
-
-		std::cout << " " << output_frames << "/" << input_frames << " x" << accumulated_frames << " ~" << motion << "\n";
 	}
 
 	std::cout << "done.\n";
