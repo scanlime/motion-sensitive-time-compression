@@ -3,6 +3,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <iostream>
+#include <npp.h>
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv2/cudacodec.hpp>
@@ -12,7 +13,13 @@
 #include <opencv2/cudabgsegm.hpp>
 #include <opencv2/cudafilters.hpp>
 #include <opencv2/cudev/common.hpp>
+#include <opencv2/core/cuda_stream_accessor.hpp>
 
+// Direct access to NPP core, for nppSetStream() optimization below
+#pragma comment(lib, "nppc")
+
+// OpenCV in debug or release flavor
+#ifdef NDEBUG
 #pragma comment(lib, "opencv_core410")
 #pragma comment(lib, "opencv_cudabgsegm410")
 #pragma comment(lib, "opencv_cudaarithm410")
@@ -22,6 +29,17 @@
 #pragma comment(lib, "opencv_cudacodec410")
 #pragma comment(lib, "opencv_videoio410")
 #pragma comment(lib, "opencv_imgproc410")
+#else
+#pragma comment(lib, "opencv_core410d")
+#pragma comment(lib, "opencv_cudabgsegm410d")
+#pragma comment(lib, "opencv_cudaarithm410d")
+#pragma comment(lib, "opencv_cudafilters410d")
+#pragma comment(lib, "opencv_cudaimgproc410d")
+#pragma comment(lib, "opencv_cudaoptflow410d")
+#pragma comment(lib, "opencv_cudacodec410d")
+#pragma comment(lib, "opencv_videoio410d")
+#pragma comment(lib, "opencv_imgproc410d")
+#endif
 
 cv::String timestamp()
 {
@@ -52,6 +70,20 @@ int main(int argc, char **argv)
 	std::cout << "threshold = " << threshold << "\n";
 	std::cout << "debug = " << debug_output << "\n";
 
+	// Buffer pools are off by default, must be enabled before creating the first stream,
+	// they are used inside many OpenCV algorithms; we want very much to avoid memory
+	// allocation in the main loop, as it will cause the API to wait for the GPU.
+	cv::cuda::setBufferPoolUsage(true);
+	cv::cuda::setBufferPoolConfig(-1, 64 * 1024 * 1024, 32);
+
+	// Single global stream
+	cv::cuda::Stream stream;
+
+	// Some OpenCV algorithms are based on the NPP library, which uses a global current stream.
+	// To avoid synchronization due to a stream save/restore every time OpenCV uses NPP, we
+	// need to preset NPP's current stream to our own.
+	nppSetStream(cv::cuda::StreamAccessor::getStream(stream));
+
 	cv::Ptr<cv::cudacodec::VideoReader> input = cv::cudacodec::createVideoReader(inputFile);
 	cv::cudacodec::FormatInfo format = input->format();
 	std::cout << "Input ok!\n" << inputFile << ", " << format.width << " x " << format.height << "\n";
@@ -77,7 +109,6 @@ int main(int argc, char **argv)
 	unsigned rgbx_num_accumulated_frames = 0;
 	double motion = 0;
 
-	cv::cuda::Stream stream;
 	cv::Ptr<cv::cuda::DenseOpticalFlow> flow_algorithm = cv::cuda::DensePyrLKOpticalFlow::create();
 	cv::Ptr<cv::cuda::BackgroundSubtractorMOG> bg_algorithm = cv::cuda::createBackgroundSubtractorMOG();
 	cv::Ptr<cv::cuda::Filter> bg_erode = cv::cuda::createMorphologyFilter(cv::MORPH_ERODE, CV_8UC1, cv::Mat::ones(cv::Size(3, 3), CV_8UC1));
