@@ -99,6 +99,13 @@ int main(int argc, char **argv)
 		output_size.height = 1080;
 	}
 
+	// Our real algorithmic stopping condition here is reaching a target amount of motion
+	// per frame, but in order to avoid computing optical flow on every frame we can also
+	// take an early out if the number of total foreground pixels is too low. This threshold
+	// is based on the overall motion threshold and number of pixels
+	int fgmask_threshold = threshold * format.width * format.height / 5000;
+	std::cout << "mask threshold = " << fgmask_threshold << " pixels\n";
+
 	std::cout << "Writing " << outputFile << " as " << output_size.width << " x " << output_size.height << "\n";
 	cv::VideoWriter output(outputFile, fourcc, fps, output_size);
 
@@ -106,6 +113,7 @@ int main(int argc, char **argv)
 	unsigned input_frames = 0;
 	unsigned output_frames = 0;
 	unsigned accumulated_frames = 0;
+	unsigned flow_frames = 0;
 	unsigned rgbx_num_accumulated_frames = 0;
 	double motion = 0;
 
@@ -150,17 +158,22 @@ int main(int argc, char **argv)
 
 				// Eroded foreground mask to look for masses of pixels rather than speckles
 				bg_erode->apply(fgmask, fgmask_eroded, stream);
+				int fgmask_count = cv::cuda::countNonZero(fgmask_eroded);
 
-				// Grayscale image for optical flow
-				cv::cuda::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY, 0, stream);
-
-				if (reference_gray.empty()) {
-					// Skip calculating motion threshold for now, set a reference
-					gray.copyTo(reference_gray, stream);
+				if (fgmask_count < fgmask_threshold) {
+					// Too few pixels set in eroded foreground mask, skip the optical flow entirely
+					motion = 0;
+				}
+				else if (reference_gray.empty()) {
+					// No reference yet. Assume no motion for now, set a reference
+					cv::cuda::cvtColor(frame, reference_gray, cv::COLOR_BGRA2GRAY, 0, stream);
+					motion = 0;
 				}
 				else {
 					// Calculate optical flow on each grayscale frame pair
+					cv::cuda::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY, 0, stream);
 					flow_algorithm->calc(reference_gray, gray, flowvec, stream);
+					flow_frames++;
 
 					// Masked flow magnitudes
 					cv::cuda::magnitude(flowvec, flowvec_mag, stream);
@@ -192,7 +205,7 @@ int main(int argc, char **argv)
 					accumulated_frames = 1;
 
 					// Update motion reference frame
-					gray.copyTo(reference_gray, stream);
+					cv::cuda::cvtColor(frame, reference_gray, cv::COLOR_BGRA2GRAY, 0, stream);
 
 					// Output a frame
 					break;
@@ -238,7 +251,12 @@ int main(int argc, char **argv)
 			}
 			output_frames++;
 
-			std::cout << " " << output_frames << "/" << input_frames << " x" << rgbx_num_accumulated_frames << " ~" << motion << "\n";
+			std::cout
+				<< " " << output_frames
+				<< "/" << input_frames
+				<< " f" << flow_frames
+				<< " x" << rgbx_num_accumulated_frames
+				<< " ~" << motion << "\n";
 		}
 	}
 
