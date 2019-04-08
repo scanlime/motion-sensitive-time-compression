@@ -38,7 +38,7 @@ cv::String timestamp()
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		std::cout << "usage: VideoSummary input_file [threshold]\n";
+		std::cout << "usage: VideoSummary input_file [threshold] [debug]\n";
 		return 1;
 	}
 
@@ -47,15 +47,25 @@ int main(int argc, char **argv)
 	const double fps = 30.0;
 	unsigned fourcc = cv::VideoWriter::fourcc('H', '2', '6', '4');
 	const double threshold = atof(argc >= 3 ? argv[2] : "0.05");
+	const bool debug_output = argc >= 4;
 
 	std::cout << "threshold = " << threshold << "\n";
+	std::cout << "debug = " << debug_output << "\n";
 
 	cv::Ptr<cv::cudacodec::VideoReader> input = cv::cudacodec::createVideoReader(inputFile);
 	cv::cudacodec::FormatInfo format = input->format();
-    std::cout << "Input ok!\n" << inputFile << ", " << format.width << " x " << format.height << "\n"; 
+	std::cout << "Input ok!\n" << inputFile << ", " << format.width << " x " << format.height << "\n";
 
-	// Stacked output images
-	cv::Size output_size = cv::Size(format.width, format.height * 4);
+	cv::Size output_size = cv::Size(format.width, format.height);
+	if (debug_output) {
+		// Vertically tiled output format
+		output_size.height *= 4;
+	}
+	else if (output_size == cv::Size(1920, 1088)) {
+		// Workaround for a bug in cudacodec, size rounded up to the next multiple of 16.
+		// This fix is just a hack specific to 1080p video.
+		output_size.height = 1080;
+	}
 
 	std::cout << "Writing " << outputFile << " as " << output_size.width << " x " << output_size.height << "\n";
 	cv::VideoWriter output(outputFile, fourcc, fps, output_size);
@@ -161,21 +171,27 @@ int main(int argc, char **argv)
 
 		if (!rgbx.empty()) {
 
-			// Visualization of the current foreground mask
-			cv::cuda::cvtColor(fgmask, fgmask_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
+			if (debug_output) {
+				// Visualization of the current foreground mask
+				cv::cuda::cvtColor(fgmask, fgmask_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
 
-			// Visualize flow magnitude with and without foreground mask
-			cv::cuda::normalize(flowvec_masked, flowvec_masked_norm, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
-			cv::cuda::cvtColor(flowvec_masked_norm, flowvec_masked_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
-			cv::cuda::normalize(flowvec_mag, flowvec_raw_norm, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
-			cv::cuda::cvtColor(flowvec_raw_norm, flowvec_raw_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
+				// Visualize flow magnitude with and without foreground mask
+				cv::cuda::normalize(flowvec_masked, flowvec_masked_norm, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
+				cv::cuda::cvtColor(flowvec_masked_norm, flowvec_masked_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
+				cv::cuda::normalize(flowvec_mag, flowvec_raw_norm, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
+				cv::cuda::cvtColor(flowvec_raw_norm, flowvec_raw_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
 
-			// Paste together output frame
-			output_frame.setTo(cv::Scalar(0.0), stream);
-			rgbx.copyTo(output_frame.rowRange(format.height * 0, format.height * 1), stream);
-			flowvec_masked_rgbx.copyTo(output_frame.rowRange(format.height * 1, format.height * 2), stream);
-			flowvec_raw_rgbx.copyTo(output_frame.rowRange(format.height * 2, format.height * 3), stream);
-			fgmask_rgbx.copyTo(output_frame.rowRange(format.height * 3, format.height * 4), stream);
+				// Paste together output frame
+				output_frame.setTo(cv::Scalar(0.0), stream);
+				rgbx.copyTo(output_frame.rowRange(format.height * 0, format.height * 1), stream);
+				flowvec_masked_rgbx.copyTo(output_frame.rowRange(format.height * 1, format.height * 2), stream);
+				flowvec_raw_rgbx.copyTo(output_frame.rowRange(format.height * 2, format.height * 3), stream);
+				fgmask_rgbx.copyTo(output_frame.rowRange(format.height * 3, format.height * 4), stream);
+			}
+			else {
+				// Non-debug path, but may be cropping the frame
+				output_frame = rgbx(cv::Rect(cv::Point(0, 0), output_size));
+			}
 
 			// Async download
 			unsigned this_buffer = output_frames % 2;
