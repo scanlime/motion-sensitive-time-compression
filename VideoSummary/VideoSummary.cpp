@@ -108,7 +108,7 @@ int main(int argc, char **argv)
 	// per frame, but in order to avoid computing optical flow on every frame we can also
 	// take an early out if the number of total foreground pixels is too low. This threshold
 	// is based on the overall motion threshold and number of pixels
-	int fgmask_threshold = int(threshold * format.width * format.height / 2000);
+	int fgmask_threshold = std::max<int>(1, (threshold * format.width * format.height / 10000));
 	std::cout << "mask threshold = " << fgmask_threshold << " pixels\n";
 
 	std::cout << "Writing " << outputFile << " as " << output_size.width << " x " << output_size.height << "\n";
