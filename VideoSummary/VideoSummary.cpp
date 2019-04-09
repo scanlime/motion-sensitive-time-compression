@@ -12,6 +12,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/cudabgsegm.hpp>
 #include <opencv2/cudafilters.hpp>
+#include <opencv2/cudawarping.hpp>
 #include <opencv2/cudev/common.hpp>
 #include <opencv2/core/cuda_stream_accessor.hpp>
 
@@ -27,6 +28,7 @@
 #pragma comment(lib, "opencv_cudaimgproc410")
 #pragma comment(lib, "opencv_cudaoptflow410")
 #pragma comment(lib, "opencv_cudacodec410")
+#pragma comment(lib, "opencv_cudawarping410")
 #pragma comment(lib, "opencv_videoio410")
 #pragma comment(lib, "opencv_imgproc410")
 #else
@@ -37,6 +39,7 @@
 #pragma comment(lib, "opencv_cudaimgproc410d")
 #pragma comment(lib, "opencv_cudaoptflow410d")
 #pragma comment(lib, "opencv_cudacodec410d")
+#pragma comment(lib, "opencv_cudawarping410d")
 #pragma comment(lib, "opencv_videoio410d")
 #pragma comment(lib, "opencv_imgproc410d")
 #endif
@@ -64,8 +67,9 @@ int main(int argc, char **argv)
 	cv::String outputFile = "F:/recording/summary-" + timestamp() + ".avi";
 	const double fps = 30.0;
 	unsigned fourcc = cv::VideoWriter::fourcc('H', '2', '6', '4');
-	const double threshold = atof(argc >= 3 ? argv[2] : "0.05");
+	const double threshold = atof(argc >= 3 ? argv[2] : "0.01");
 	const bool debug_output = argc >= 4;
+	const int flow_downscale_levels = 2;
 
 	std::cout << "threshold = " << threshold << "\n";
 	std::cout << "debug = " << debug_output << "\n";
@@ -91,7 +95,7 @@ int main(int argc, char **argv)
 	cv::Size output_size = cv::Size(format.width, format.height);
 	if (debug_output) {
 		// Vertically tiled output format
-		output_size.height *= 4;
+		output_size.height *= 2;
 	}
 	else if (output_size == cv::Size(1920, 1088)) {
 		// Workaround for a bug in cudacodec, size rounded up to the next multiple of 16.
@@ -103,7 +107,7 @@ int main(int argc, char **argv)
 	// per frame, but in order to avoid computing optical flow on every frame we can also
 	// take an early out if the number of total foreground pixels is too low. This threshold
 	// is based on the overall motion threshold and number of pixels
-	int fgmask_threshold = threshold * format.width * format.height / 5000;
+	int fgmask_threshold = int(threshold * format.width * format.height / 5000);
 	std::cout << "mask threshold = " << fgmask_threshold << " pixels\n";
 
 	std::cout << "Writing " << outputFile << " as " << output_size.width << " x " << output_size.height << "\n";
@@ -125,13 +129,22 @@ int main(int argc, char **argv)
 	cv::cuda::GpuMat next_accumulator(format.height, format.width, CV_32SC4);
 	cv::cuda::GpuMat output_frame(output_size.height, output_size.width, CV_8UC4);
 	cv::cuda::GpuMat flowvec(format.height, format.width, CV_32FC2);
-	cv::cuda::GpuMat flowvec_mag(format.height, format.width, CV_32FC1);
-	cv::cuda::GpuMat flowvec_masked(format.height, format.width, CV_32FC1);
+	cv::cuda::GpuMat flowvec_magsqr(format.height, format.width, CV_32FC1);
 
-	cv::cuda::GpuMat flowvec_raw_norm, flowvec_masked_norm, flowvec_raw_rgbx, flowvec_masked_rgbx;
-	cv::cuda::GpuMat rgbx, gray_unmasked, gray, reference_gray;
+	cv::cuda::GpuMat fgmask_count_buffer(1, 1, CV_32SC1);
+	cv::cuda::Event fgmask_count_event;
+	int fgmask_count;
+
+	cv::cuda::GpuMat flowvec_sqrsum_buffer(1, 1, CV_64FC1);
+	cv::cuda::Event flowvec_sqrsum_event;
+	double flowvec_sqrsum;
+
+	cv::cuda::GpuMat flowvec_debug_norm, flowvec_debug_rgbx, fgmask_debug_rgbx;
+	cv::cuda::GpuMat rgbx, gray, reference_gray;
 	cv::cuda::GpuMat frame, wide_frame;
-	cv::cuda::GpuMat fgmask, fgmask_rgbx, fgmask_eroded;
+	cv::cuda::GpuMat fgmask, fgmask_eroded;
+	cv::cuda::GpuMat gray_pyramid[flow_downscale_levels];
+	cv::cuda::GpuMat fgmask_pyramid[flow_downscale_levels];
 
 	cv::Mat output_buffers[2] = { 
 		cv::Mat(format.height, format.width, CV_8UC4),
@@ -158,7 +171,28 @@ int main(int argc, char **argv)
 
 				// Eroded foreground mask to look for masses of pixels rather than speckles
 				bg_erode->apply(fgmask, fgmask_eroded, stream);
-				int fgmask_count = cv::cuda::countNonZero(fgmask_eroded);
+
+				// Asynchronously start preparing a count of how many foreground pixels are set after eroding.
+				// This will be used later as an early out to skip running optical flow on frames that won't have
+				// enough motion but we also don't want this operation to stall the pipeline entirely
+				cv::cuda::countNonZero(fgmask_eroded, fgmask_count_buffer, stream);
+				fgmask_count_buffer.download(cv::Mat(1, 1, CV_32SC1, &fgmask_count), stream);
+				fgmask_count_event.record(stream);
+
+				// While that's happening in the background, start preparing inputs to the optical flow.
+				// The algorithm doesn't use color information anyway, so we need to convert to gray, and for
+				// performance we'll start with a lower resolution image. The eroded mask needs to be scaled
+				// by the same amount.
+				cv::cuda::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY, 0, stream);
+				for (int n = 0; n < flow_downscale_levels; n++) {
+					const int level = flow_downscale_levels - 1 - n;
+					const int prev = level + 1;
+					cv::cudev::pyrDown(n ? gray_pyramid[prev] : gray, gray_pyramid[level], stream);
+					cv::cudev::pyrDown(n ? fgmask_pyramid[prev] : fgmask_eroded, fgmask_pyramid[level], stream);
+				}
+
+				// Now wait for the fgmask count hopefully while the above conversions and pyrDown are still taking place
+				fgmask_count_event.waitForCompletion();
 
 				if (fgmask_count < fgmask_threshold) {
 					// Too few pixels set in eroded foreground mask, skip the optical flow entirely
@@ -166,22 +200,24 @@ int main(int argc, char **argv)
 				}
 				else if (reference_gray.empty()) {
 					// No reference yet. Assume no motion for now, set a reference
-					cv::cuda::cvtColor(frame, reference_gray, cv::COLOR_BGRA2GRAY, 0, stream);
+					gray_pyramid[0].copyTo(reference_gray, stream);
 					motion = 0;
 				}
 				else {
 					// Calculate optical flow on each grayscale frame pair
-					cv::cuda::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY, 0, stream);
-					flow_algorithm->calc(reference_gray, gray, flowvec, stream);
+					flow_algorithm->calc(reference_gray, gray_pyramid[0], flowvec, stream);
+					cv::cuda::magnitudeSqr(flowvec, flowvec_magsqr, stream);
 					flow_frames++;
 
-					// Masked flow magnitudes
-					cv::cuda::magnitude(flowvec, flowvec_mag, stream);
-					flowvec_masked.setTo(cv::Scalar(0.0), cv::noArray(), stream);
-					flowvec_mag.copyTo(flowvec_masked, fgmask_eroded, stream);
+					// Motion total is average of values squared; calculate it asynchronously
+					cv::cuda::calcSum(flowvec_magsqr, flowvec_sqrsum_buffer, fgmask_pyramid[0], stream);					
+					flowvec_sqrsum_buffer.download(cv::Mat(1, 1, CV_64FC1, &flowvec_sqrsum), stream);
+					flowvec_sqrsum_event.record(stream);
 
-					// Motion total is average of values squared
-					motion = cv::cuda::sqrSum(flowvec_masked).val[0] / (double)flowvec_masked.size().area();
+					// Fix me: is there some GPU work we can move here to avoid a stall?
+
+					flowvec_sqrsum_event.waitForCompletion();
+					motion = flowvec_sqrsum / (double)flowvec_magsqr.size().area();
 				}
 
 				if (motion < threshold) {
@@ -205,7 +241,7 @@ int main(int argc, char **argv)
 					accumulated_frames = 1;
 
 					// Update motion reference frame
-					cv::cuda::cvtColor(frame, reference_gray, cv::COLOR_BGRA2GRAY, 0, stream);
+					gray_pyramid[0].copyTo(reference_gray, stream);
 
 					// Output a frame
 					break;
@@ -217,20 +253,26 @@ int main(int argc, char **argv)
 
 			if (debug_output) {
 				// Visualization of the current foreground mask
-				cv::cuda::cvtColor(fgmask, fgmask_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
+				cv::cuda::cvtColor(fgmask_pyramid[0], fgmask_debug_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
 
 				// Visualize flow magnitude with and without foreground mask
-				cv::cuda::normalize(flowvec_masked, flowvec_masked_norm, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
-				cv::cuda::cvtColor(flowvec_masked_norm, flowvec_masked_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
-				cv::cuda::normalize(flowvec_mag, flowvec_raw_norm, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
-				cv::cuda::cvtColor(flowvec_raw_norm, flowvec_raw_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
+				cv::cuda::normalize(flowvec_magsqr, flowvec_debug_norm, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
+				cv::cuda::cvtColor(flowvec_debug_norm, flowvec_debug_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
 
-				// Paste together output frame
+				// Paste together output, starting with an empty frame
 				output_frame.setTo(cv::Scalar(0.0), stream);
-				rgbx.copyTo(output_frame.rowRange(format.height * 0, format.height * 1), stream);
-				flowvec_masked_rgbx.copyTo(output_frame.rowRange(format.height * 1, format.height * 2), stream);
-				flowvec_raw_rgbx.copyTo(output_frame.rowRange(format.height * 2, format.height * 3), stream);
-				fgmask_rgbx.copyTo(output_frame.rowRange(format.height * 3, format.height * 4), stream);
+				cv::Size upper_size = frame.size();
+				cv::Size lower_size = flowvec.size();
+				cv::cuda::GpuMat upper_frame = output_frame(cv::Rect(cv::Point(0, 0), upper_size));
+				cv::cuda::GpuMat lower_frame_0 = output_frame(cv::Rect(cv::Point(0, upper_size.height), lower_size));
+				cv::cuda::GpuMat lower_frame_1 = output_frame(cv::Rect(cv::Point(0, upper_size.height + lower_size.height), lower_size));
+
+				// Original resoution RGBX on top
+				rgbx.copyTo(upper_frame, stream);
+
+				// Low res debug frames on bottom
+				fgmask_debug_rgbx.copyTo(lower_frame_0, stream);
+				flowvec_debug_rgbx.copyTo(lower_frame_1, stream);
 			}
 			else {
 				// Non-debug path, but may be cropping the frame
