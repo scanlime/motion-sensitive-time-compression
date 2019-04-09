@@ -67,7 +67,7 @@ int main(int argc, char **argv)
 	cv::String outputFile = "F:/recording/summary-" + timestamp() + ".avi";
 	const double fps = 30.0;
 	unsigned fourcc = cv::VideoWriter::fourcc('H', '2', '6', '4');
-	const double threshold = atof(argc >= 3 ? argv[2] : "0.01");
+	const double threshold = atof(argc >= 3 ? argv[2] : "0.05");
 	const bool debug_output = argc >= 4;
 	const int flow_downscale_levels = 2;
 	const int num_debug_frames = 3;
@@ -165,6 +165,7 @@ int main(int argc, char **argv)
 			else {
 				input_frames++;
 			}
+			continue;
 
 			if (!frame.empty()) {
 				// Update a background subtractor model with the original-rate video
@@ -216,9 +217,15 @@ int main(int argc, char **argv)
 					flowvec_sqrsum_event.record(stream);
 
 					// Fix me: is there some GPU work we can move here to avoid a stall?
+					// How about the decode and segmentation for the next frame?
 
+					// Wait for the squared magnitude. Adjust it according to the number of pixels,
+					// so that we're measuring average of the square, and also according to the
+					// square of the downscale level, since that changes the length of the measured vectors.
 					flowvec_sqrsum_event.waitForCompletion();
-					motion = flowvec_sqrsum / (double)flowvec_magsqr.size().area();
+					motion = flowvec_sqrsum
+						* (double)(1 << (flow_downscale_levels + 1))
+						/ (double)flowvec_magsqr.size().area();
 				}
 
 				if (motion < threshold) {
