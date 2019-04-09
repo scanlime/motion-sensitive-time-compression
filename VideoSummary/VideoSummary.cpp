@@ -165,7 +165,6 @@ int main(int argc, char **argv)
 			else {
 				input_frames++;
 			}
-			continue;
 
 			if (!frame.empty()) {
 				// Update a background subtractor model with the original-rate video
