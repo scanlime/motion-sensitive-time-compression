@@ -70,6 +70,7 @@ int main(int argc, char **argv)
 	const double threshold = atof(argc >= 3 ? argv[2] : "0.01");
 	const bool debug_output = argc >= 4;
 	const int flow_downscale_levels = 2;
+	const int num_debug_frames = 3;
 
 	std::cout << "threshold = " << threshold << "\n";
 	std::cout << "debug = " << debug_output << "\n";
@@ -95,7 +96,7 @@ int main(int argc, char **argv)
 	cv::Size output_size = cv::Size(format.width, format.height);
 	if (debug_output) {
 		// Vertically tiled output format
-		output_size.height *= 2;
+		output_size.height *= num_debug_frames;
 	}
 	else if (output_size == cv::Size(1920, 1088)) {
 		// Workaround for a bug in cudacodec, size rounded up to the next multiple of 16.
@@ -107,7 +108,7 @@ int main(int argc, char **argv)
 	// per frame, but in order to avoid computing optical flow on every frame we can also
 	// take an early out if the number of total foreground pixels is too low. This threshold
 	// is based on the overall motion threshold and number of pixels
-	int fgmask_threshold = int(threshold * format.width * format.height / 5000);
+	int fgmask_threshold = int(threshold * format.width * format.height / 2000);
 	std::cout << "mask threshold = " << fgmask_threshold << " pixels\n";
 
 	std::cout << "Writing " << outputFile << " as " << output_size.width << " x " << output_size.height << "\n";
@@ -261,18 +262,17 @@ int main(int argc, char **argv)
 
 				// Paste together output, starting with an empty frame
 				output_frame.setTo(cv::Scalar(0.0), stream);
-				cv::Size upper_size = frame.size();
-				cv::Size lower_size = flowvec.size();
-				cv::cuda::GpuMat upper_frame = output_frame(cv::Rect(cv::Point(0, 0), upper_size));
-				cv::cuda::GpuMat lower_frame_0 = output_frame(cv::Rect(cv::Point(0, upper_size.height), lower_size));
-				cv::cuda::GpuMat lower_frame_1 = output_frame(cv::Rect(cv::Point(0, upper_size.height + lower_size.height), lower_size));
+				cv::cuda::GpuMat debug_frames[num_debug_frames];
+				for (int n = 0; n < num_debug_frames; n++) {
+					debug_frames[n] = output_frame.rowRange(format.height * n, format.height * (n + 1));
+				}
 
 				// Original resoution RGBX on top
-				rgbx.copyTo(upper_frame, stream);
+				rgbx.copyTo(debug_frames[0], stream);
 
-				// Low res debug frames on bottom
-				fgmask_debug_rgbx.copyTo(lower_frame_0, stream);
-				flowvec_debug_rgbx.copyTo(lower_frame_1, stream);
+				// Low res debug frames on bottom, scaled up to match
+				cv::cudev::resize(fgmask_debug_rgbx, debug_frames[1], debug_frames[1].size(), 0, 0, cv::INTER_LINEAR, stream);
+				cv::cudev::resize(flowvec_debug_rgbx, debug_frames[2], debug_frames[2].size(), 0, 0, cv::INTER_LINEAR, stream);
 			}
 			else {
 				// Non-debug path, but may be cropping the frame
