@@ -10,7 +10,7 @@ VideoSummary::Options::Options() :
 
 namespace VideoSummary {
     static const double FLOW_IMAGE_SCALE = 1 / 3.0;
-    static const double FGMASK_THRESHOLD_CONST = 2e-5;
+    static const double FGMASK_THRESHOLD_CONST = 3e-4;
     static const int DEBUG_HEIGHT_MULTIPLE = 3;
     static const int BUFFER_STACK_SIZE = 64 * 1024 * 1024;
     static const int BUFFER_STACK_COUNT = 8;
