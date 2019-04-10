@@ -1,25 +1,96 @@
 #include "pch.h"
 #include "VideoSummary.h"
 
-VideoSummary::Options::Options()
-    : threshold(0.05),
+VideoSummary::Options::Options() :
+    threshold(0.04),
     output_fps(30),
     debug(false),
     verbose(true)
 {}
 
 namespace VideoSummary {
+    static const double FLOW_IMAGE_SCALE = 1 / 3.0;
+    static const double FGMASK_THRESHOLD_CONST = 2e-4;
+    static const int DEBUG_HEIGHT_MULTIPLE = 3;
+    static const int BUFFER_STACK_SIZE = 64 * 1024 * 1024;
+    static const int BUFFER_STACK_COUNT = 8;
+
     class VideoSummaryImpl {
     public:
-        VideoSummaryImpl(const Options &opt)
-            : opt(opt) {}
-
+        VideoSummaryImpl(const Options &opt);
         void run(cv::cuda::Stream &stream);
 
     private:
-        Options opt;
+        const Options &opt;
+        int input_file_index;
+        bool end_of_input;
+
+        unsigned count_input_frames;
+        unsigned count_output_frames;
+        unsigned count_optical_flow;
+        
+        int accumulator_count;
+        int last_accumulator_count;
+        double last_motion_sum;
+        int fgmask_threshold;
+
+        cv::Ptr<cv::cuda::DenseOpticalFlow> flow_algorithm;
+        cv::Ptr<cv::cuda::BackgroundSubtractorMOG> bg_algorithm;
+        cv::Ptr<cv::cuda::Filter> bg_erode;
+
+        cv::cuda::GpuMat fgmask, fgmask_eroded, fgmask_eroded_scaled;
+        cv::cuda::GpuMat fgmask_wide, fgmask_accum, fgmask_accum_next;
+
+        cv::cuda::GpuMat color_wide, color_accum, color_accum_next;
+
+        cv::cuda::GpuMat debug_fgmask_rgbx, debug_fgmask_gray;
+        cv::cuda::GpuMat debug_flow_rgbx, debug_flow_gray;
+
+        cv::cuda::GpuMat fgmask_count_buffer;
+        cv::cuda::Event fgmask_count_event;
+        int fgmask_count;
+
+        cv::cuda::GpuMat flowvec_sqrsum_buffer;
+        cv::cuda::Event flowvec_sqrsum_event;
+        double flowvec_sqrsum;
+
+        cv::Ptr<cv::cudacodec::VideoReader> input_reader;
+        cv::cuda::GpuMat input_frame, input_uncropped, input_gray;
+
+        cv::cuda::GpuMat flow_input_frame, flow_reference_frame;
+        cv::cuda::GpuMat flowvec, flowvec_magsqr, flowvec_masked;
+
+        cv::VideoWriter output_writer;
+        cv::cuda::GpuMat output_frame;
+        cv::Mat output_buffers[2];
+        cv::cuda::Event output_events[2];
+
+        void inputRead();
+        void outputBegin();
+        void outputWrite(cv::cuda::Stream &stream);
+        void initThreshold();
+        void initAlgorithms();
+        void calcForeground(cv::cuda::Stream &stream);
+        bool canSkipOpticalFlow();
+        void calcOpticalFlow(cv::cuda::Stream &stream);
+        void finishMotionSum();
+        void commitAccumulator();
+        void resetAccumulatorToSingleFrame();
+        void printCurrentFrameNumbers();
     };
 }
+
+VideoSummary::VideoSummaryImpl::VideoSummaryImpl(const Options &opt) :
+    opt(opt),
+    input_file_index(0),
+    end_of_input(false),
+    count_input_frames(0),
+    count_output_frames(0),
+    count_optical_flow(0),
+    accumulator_count(0),
+    last_accumulator_count(0),
+    last_motion_sum(0)
+{}
 
 void VideoSummary::run(const VideoSummary::Options &opt)
 {
@@ -29,7 +100,7 @@ void VideoSummary::run(const VideoSummary::Options &opt)
     // they are used inside many OpenCV algorithms; we want very much to avoid memory
     // allocation in the main loop, as it will cause the API to wait for the GPU.
     cv::cuda::setBufferPoolUsage(true);
-    cv::cuda::setBufferPoolConfig(-1, 64 * 1024 * 1024, 32);
+    cv::cuda::setBufferPoolConfig(-1, BUFFER_STACK_SIZE, BUFFER_STACK_COUNT);
 
     // Single global stream
     cv::cuda::Stream stream;
@@ -42,231 +113,337 @@ void VideoSummary::run(const VideoSummary::Options &opt)
     impl.run(stream);
 }
 
-void VideoSummary::VideoSummaryImpl::run(cv::cuda::Stream &stream)
+void VideoSummary::VideoSummaryImpl::inputRead()
 {
-    unsigned fourcc = cv::VideoWriter::fourcc('H', '2', '6', '4');
-    const int flow_downscale_levels = 2;
-    const int num_debug_frames = 3;
+    while (!end_of_input) {
+        if (input_file_index >= opt.input_files.size()) {
+            end_of_input = true;
+            break;
+        }
 
-    cv::Ptr<cv::cudacodec::VideoReader> input = cv::cudacodec::createVideoReader(opt.input_files[0]);
-    cv::cudacodec::FormatInfo format = input->format();
-    std::cout << "Input ok!\n" << opt.input_files[0] << ", " << format.width << " x " << format.height << "\n";
+        // Switching files
+        if (input_reader.empty()) {
+            const std::string &input_file = opt.input_files[input_file_index];
+            input_reader = cv::cudacodec::createVideoReader(input_file);
+            cv::cudacodec::FormatInfo format = input_reader->format();
 
-    cv::Size output_size = cv::Size(format.width, format.height);
+            cv::Size frame_size(format.width, format.height);
+            if (frame_size == cv::Size(1920, 1088)) {
+                // Workaround for a bug in cudacodec, size rounded up to the next multiple of 16.
+                // This fix is just a hack specific to 1080p video.
+                frame_size.height = 1080;
+            }
+
+            if (opt.verbose) {
+                std::cout << "Input file " << input_file << " is "
+                    << frame_size.width << " x " << frame_size.height << std::endl;
+            }
+
+            if (!input_reader->nextFrame(input_uncropped) || input_uncropped.empty()) {
+                throw std::runtime_error("Failed to decode the first video frame!");
+            }
+
+            if (!input_frame.empty() && input_frame.size() != frame_size) {
+                throw std::runtime_error("Video size changed! All inputs must be the same resolution.");
+            }
+
+            // Reference our cropped area of the full decoded frame without copying
+            input_frame = input_uncropped(cv::Rect(cv::Point(0, 0), frame_size));
+            break;
+        }
+
+        if (input_reader->nextFrame(input_uncropped)) {
+            break;
+        }
+        else {
+            input_reader = 0;
+            input_file_index++;
+        }
+    }
+
+    if (!end_of_input) {
+        count_input_frames++;
+    }
+}
+
+void VideoSummary::VideoSummaryImpl::outputBegin()
+{
+    assert(!input_frame.empty());
+    cv::Size input_size = input_frame.size();
+    cv::Size debug_size(input_size.width, input_size.height * DEBUG_HEIGHT_MULTIPLE);
+    cv::Size output_size = opt.debug ? debug_size : input_size;
+
+    output_frame.create(output_size, CV_8UC4);
+
+    if (opt.verbose) {
+        std::cout << "Writing " << opt.output_file
+            << " as " << output_size.width << " x " << output_size.height
+            << std::endl;
+    }
+
+    output_writer.open(opt.output_file,
+        cv::CAP_FFMPEG,
+        cv::VideoWriter::fourcc('H', '2', '6', '4'),
+        opt.output_fps, output_size);
+}
+
+void VideoSummary::VideoSummaryImpl::outputWrite(cv::cuda::Stream &stream)
+{
+    if (accumulator_count < 1) {
+        return;
+    }
+    last_accumulator_count = accumulator_count;
+
+    cv::cuda::GpuMat color_output_ref;
     if (opt.debug) {
-        // Vertically tiled output format
-        output_size.height *= num_debug_frames;
+        cv::Size input_size = input_frame.size();
+
+        // Paste together a debug image from stacked frames
+        cv::cuda::GpuMat debug_frames[DEBUG_HEIGHT_MULTIPLE];
+        for (int n = 0; n < DEBUG_HEIGHT_MULTIPLE; n++) {
+            debug_frames[n] = output_frame.rowRange(input_size.height * n, input_size.height * (n + 1));
+        }
+
+        // Regular color image on top
+        color_output_ref = debug_frames[0];
+
+        // Normalize debug data to fit in 8U
+        cv::cuda::normalize(fgmask_accum_next, debug_fgmask_gray, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
+        cv::cuda::normalize(flowvec_masked, debug_flow_gray, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
+
+        // Grayscale (normalized) to RGBX to match output
+        cv::cuda::cvtColor(debug_fgmask_gray, debug_fgmask_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
+        cv::cuda::cvtColor(debug_flow_gray, debug_flow_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
+
+        // Low res debug frames on bottom, scaled up to match
+        cv::cudev::resize(debug_fgmask_rgbx, debug_frames[1], debug_frames[1].size(), 0, 0, cv::INTER_LINEAR, stream);
+        cv::cudev::resize(debug_flow_rgbx, debug_frames[2], debug_frames[2].size(), 0, 0, cv::INTER_LINEAR, stream);
     }
-    else if (output_size == cv::Size(1920, 1088)) {
-        // Workaround for a bug in cudacodec, size rounded up to the next multiple of 16.
-        // This fix is just a hack specific to 1080p video.
-        output_size.height = 1080;
+    else {
+        color_output_ref = output_frame;
     }
+
+    // Convert accumulator to 8U
+    color_accum.convertTo(color_output_ref, CV_8UC4, 1.0 / accumulator_count, stream);
+
+    // Async download
+    unsigned this_buffer = count_output_frames % 2;
+    output_frame.download(output_buffers[this_buffer], stream);
+    output_events[this_buffer].record(stream);
+
+    if (count_output_frames > 0) {
+        // Complete the previous frame on the CPU side, hopefully without blocking
+        output_events[!this_buffer].waitForCompletion();
+        cv::Mat rgb, &rgbx = output_buffers[!this_buffer];
+        cv::cvtColor(rgbx, rgb, cv::COLOR_BGRA2BGR);
+        output_writer.write(rgb);
+    }
+    count_output_frames++;
+}
+
+void VideoSummary::VideoSummaryImpl::initThreshold()
+{
+    cv::Size frame_size = output_frame.size();
 
     // Our real algorithmic stopping condition here is reaching a target amount of motion
     // per frame, but in order to avoid computing optical flow on every frame we can also
     // take an early out if the number of total foreground pixels is too low. This threshold
     // is based on the overall motion threshold and number of pixels
-    int fgmask_threshold = std::max<int>(1, (opt.threshold * format.width * format.height / (1 << (flow_downscale_levels + 1)) / 3000));
-    std::cout << "mask threshold = " << fgmask_threshold << " pixels\n";
 
-    std::cout << "Writing " << opt.output_file << " as " << output_size.width << " x " << output_size.height << "\n";
-    cv::VideoWriter output(opt.output_file, fourcc, opt.output_fps, output_size);
+    fgmask_threshold = std::max<int>(1, int(
+        opt.threshold * frame_size.area() * FLOW_IMAGE_SCALE * FGMASK_THRESHOLD_CONST));
 
-    bool eof = false;
-    unsigned input_frames = 0;
-    unsigned output_frames = 0;
-    unsigned accumulated_frames = 0;
-    unsigned flow_frames = 0;
-    unsigned rgbx_num_accumulated_frames = 0;
-    double motion = 0;
+    if (opt.verbose) {
+        std::cout << "threshold = " << opt.threshold << std::endl;
+        std::cout << "mask threshold = " << fgmask_threshold << " pixels" << std::endl;
+    }
+}
 
-    cv::Ptr<cv::cuda::DenseOpticalFlow> flow_algorithm = cv::cuda::DensePyrLKOpticalFlow::create();
-    cv::Ptr<cv::cuda::BackgroundSubtractorMOG> bg_algorithm = cv::cuda::createBackgroundSubtractorMOG();
-    cv::Ptr<cv::cuda::Filter> bg_erode = cv::cuda::createMorphologyFilter(cv::MORPH_ERODE, CV_8UC1, cv::Mat::ones(cv::Size(3, 3), CV_8UC1));
+void VideoSummary::VideoSummaryImpl::initAlgorithms()
+{
+    flow_algorithm = cv::cuda::DensePyrLKOpticalFlow::create();
+    bg_algorithm = cv::cuda::createBackgroundSubtractorMOG();
+    bg_erode = cv::cuda::createMorphologyFilter(cv::MORPH_ERODE, CV_8UC1, cv::Mat::ones(cv::Size(3, 3), CV_8UC1));
+}
 
-    cv::cuda::GpuMat accumulator(format.height, format.width, CV_32SC4);
-    cv::cuda::GpuMat next_accumulator(format.height, format.width, CV_32SC4);
-    cv::cuda::GpuMat output_frame(output_size.height, output_size.width, CV_8UC4);
-    cv::cuda::GpuMat flowvec(format.height, format.width, CV_32FC2);
-    cv::cuda::GpuMat flowvec_magsqr(format.height, format.width, CV_32FC1);
+void VideoSummary::VideoSummaryImpl::calcForeground(cv::cuda::Stream &stream)
+{
+    // Update a background subtractor model with the original-rate video
+    bg_algorithm->apply(input_frame, fgmask, -1, stream);
 
-    cv::cuda::GpuMat fgmask_count_buffer(1, 1, CV_32SC1);
-    cv::cuda::Event fgmask_count_event;
-    int fgmask_count;
+    // Eroded foreground mask to look for masses of pixels rather than speckles
+    bg_erode->apply(fgmask, fgmask_eroded, stream);
 
-    cv::cuda::GpuMat flowvec_sqrsum_buffer(1, 1, CV_64FC1);
-    cv::cuda::Event flowvec_sqrsum_event;
-    double flowvec_sqrsum;
+    // Scale down a version of the eroded foreground mask to match the size of our optical flow source
+    cv::cuda::resize(fgmask_eroded, fgmask_eroded_scaled, cv::Size(0, 0), FLOW_IMAGE_SCALE, FLOW_IMAGE_SCALE, cv::INTER_AREA, stream);
 
-    cv::cuda::GpuMat flowvec_debug_norm, flowvec_debug_rgbx, fgmask_debug_rgbx;
-    cv::cuda::GpuMat rgbx, gray, reference_gray;
-    cv::cuda::GpuMat frame, wide_frame;
-    cv::cuda::GpuMat fgmask, fgmask_eroded;
-    cv::cuda::GpuMat gray_pyramid[flow_downscale_levels];
-    cv::cuda::GpuMat fgmask_pyramid[flow_downscale_levels];
+    // During optical flow we want to track not just the instantaneous foreground pixels but the foreground
+    // pixels detected during the whole frame averaging group. This frame hasn't been committed to the
+    // accumulator yet, so we need to consider the sum of the accumulator and this fgmask we just made.
+    // Since that's the same calculation we need for the next frame's accumulator, we will calculate
+    // that now and swap it in later.
 
-    cv::Mat output_buffers[2] = {
-        cv::Mat(format.height, format.width, CV_8UC4),
-        cv::Mat(format.height, format.width, CV_8UC4)
-    };
-    cv::cuda::Event output_events[2];
-
-    // Looping over output frames
-    while (!eof) {
-
-        // Looping over input frames
-        while (!eof) {
-            if (!input->nextFrame(frame)) {
-                // No more frames in input, but let the current accumulated output frame finish
-                eof = true;
-            }
-            else {
-                input_frames++;
-            }
-
-            if (!frame.empty()) {
-                // Update a background subtractor model with the original-rate video
-                bg_algorithm->apply(frame, fgmask, -1, stream);
-
-                // Eroded foreground mask to look for masses of pixels rather than speckles
-                bg_erode->apply(fgmask, fgmask_eroded, stream);
-
-                // Asynchronously start preparing a count of how many foreground pixels are set after eroding.
-                // This will be used later as an early out to skip running optical flow on frames that won't have
-                // enough motion but we also don't want this operation to stall the pipeline entirely
-                cv::cuda::countNonZero(fgmask_eroded, fgmask_count_buffer, stream);
-                fgmask_count_buffer.download(cv::Mat(1, 1, CV_32SC1, &fgmask_count), stream);
-                fgmask_count_event.record(stream);
-
-                // While that's happening in the background, start preparing inputs to the optical flow.
-                // The algorithm doesn't use color information anyway, so we need to convert to gray, and for
-                // performance we'll start with a lower resolution image. The eroded mask needs to be scaled
-                // by the same amount.
-                cv::cuda::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY, 0, stream);
-                for (int n = 0; n < flow_downscale_levels; n++) {
-                    const int level = flow_downscale_levels - 1 - n;
-                    const int prev = level + 1;
-                    cv::cudev::pyrDown(n ? gray_pyramid[prev] : gray, gray_pyramid[level], stream);
-                    cv::cudev::pyrDown(n ? fgmask_pyramid[prev] : fgmask_eroded, fgmask_pyramid[level], stream);
-                }
-
-                // Now wait for the fgmask count hopefully while the above conversions and pyrDown are still taking place
-                fgmask_count_event.waitForCompletion();
-
-                if (fgmask_count < fgmask_threshold) {
-                    // Too few pixels set in eroded foreground mask, skip the optical flow entirely
-                    motion = 0;
-                }
-                else if (reference_gray.empty()) {
-                    // No reference yet. Assume no motion for now, set a reference
-                    gray_pyramid[0].copyTo(reference_gray, stream);
-                    motion = 0;
-                }
-                else {
-                    // Calculate optical flow on each grayscale frame pair
-                    flow_algorithm->calc(reference_gray, gray_pyramid[0], flowvec, stream);
-                    cv::cuda::magnitudeSqr(flowvec, flowvec_magsqr, stream);
-                    flow_frames++;
-
-                    // Motion total is average of values squared; calculate it asynchronously
-                    cv::cuda::calcSum(flowvec_magsqr, flowvec_sqrsum_buffer, fgmask_pyramid[0], stream);
-                    flowvec_sqrsum_buffer.download(cv::Mat(1, 1, CV_64FC1, &flowvec_sqrsum), stream);
-                    flowvec_sqrsum_event.record(stream);
-
-                    // Fix me: is there some GPU work we can move here to avoid a stall?
-                    // How about the decode and segmentation for the next frame?
-
-                    // Wait for the squared magnitude. Adjust it according to the number of pixels,
-                    // so that we're measuring average of the square, and also according to the
-                    // square of the downscale level, since that changes the length of the measured vectors.
-                    flowvec_sqrsum_event.waitForCompletion();
-                    motion = flowvec_sqrsum
-                        * (double)(1 << (flow_downscale_levels + 1))
-                        / (double)flowvec_magsqr.size().area();
-                }
-
-                if (motion < opt.threshold) {
-                    // Not enough motion yet, add this frame to the accumulator
-                    frame.convertTo(wide_frame, CV_32SC4, stream);
-                    cv::cuda::add(accumulator, wide_frame, next_accumulator, cv::noArray(), CV_32SC4, stream);
-                    accumulator.swap(next_accumulator);
-                    accumulated_frames++;
-                }
-                else {
-                    // This frame exceeds the motion threshold. It will be the new reference frame, and we
-                    // will restart the accumulator with this as the first new frame. The old accumulator
-                    // is averaged and moved to rgbx.
-
-                    if (accumulated_frames >= 1) {
-                        accumulator.convertTo(rgbx, CV_8UC4, 1.0 / accumulated_frames, 0.0, stream);
-                        rgbx_num_accumulated_frames = accumulated_frames;
-                    }
-
-                    frame.convertTo(accumulator, CV_32SC4, stream);
-                    accumulated_frames = 1;
-
-                    // Update motion reference frame
-                    gray_pyramid[0].copyTo(reference_gray, stream);
-
-                    // Output a frame
-                    break;
-                }
-            }
-        }
-
-        if (!rgbx.empty()) {
-
-            if (opt.debug) {
-                // Visualization of the current foreground mask
-                cv::cuda::cvtColor(fgmask_pyramid[0], fgmask_debug_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
-
-                // Visualize flow magnitude with and without foreground mask
-                cv::cuda::normalize(flowvec_magsqr, flowvec_debug_norm, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
-                cv::cuda::cvtColor(flowvec_debug_norm, flowvec_debug_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
-
-                // Paste together output, starting with an empty frame
-                output_frame.setTo(cv::Scalar(0.0), stream);
-                cv::cuda::GpuMat debug_frames[num_debug_frames];
-                for (int n = 0; n < num_debug_frames; n++) {
-                    debug_frames[n] = output_frame.rowRange(format.height * n, format.height * (n + 1));
-                }
-
-                // Original resoution RGBX on top
-                rgbx.copyTo(debug_frames[0], stream);
-
-                // Low res debug frames on bottom, scaled up to match
-                cv::cudev::resize(fgmask_debug_rgbx, debug_frames[1], debug_frames[1].size(), 0, 0, cv::INTER_LINEAR, stream);
-                cv::cudev::resize(flowvec_debug_rgbx, debug_frames[2], debug_frames[2].size(), 0, 0, cv::INTER_LINEAR, stream);
-            }
-            else {
-                // Non-debug path, but may be cropping the frame
-                output_frame = rgbx(cv::Rect(cv::Point(0, 0), output_size));
-            }
-
-            // Async download
-            unsigned this_buffer = output_frames % 2;
-            output_frame.download(output_buffers[this_buffer], stream);
-            output_events[this_buffer].record(stream);
-
-            if (output_frames > 0) {
-                // Complete the previous frame on the CPU side, hopefully without blocking
-                output_events[!this_buffer].waitForCompletion();
-                cv::Mat rgb, &rgbx = output_buffers[!this_buffer];
-                cv::cvtColor(rgbx, rgb, cv::COLOR_BGRA2BGR);
-                output.write(rgb);
-            }
-            output_frames++;
-
-            std::cout
-                << " " << output_frames
-                << "/" << input_frames
-                << " f" << flow_frames
-                << " x" << rgbx_num_accumulated_frames
-                << " ~" << motion << "\n";
-        }
+    fgmask_eroded_scaled.convertTo(fgmask_wide, CV_32FC1, stream);
+    if (accumulator_count == 0) {
+        fgmask_wide.copyTo(fgmask_accum_next, stream);
+    }
+    else {
+        cv::cuda::add(fgmask_accum, fgmask_wide, fgmask_accum_next, cv::noArray(), CV_32FC1, stream);
     }
 
-    std::cout << "done.\n";
+    // Asynchronously start preparing a count of how many foreground pixels are set in the combined
+    // mask for the current frame and the contents of the accumulator.
+    // This will be used later as an early out to skip running optical flow on frames that won't have
+    // enough motion but we also don't want this operation to stall the pipeline entirely.
+    cv::cuda::countNonZero(fgmask_accum_next, fgmask_count_buffer, stream);
+    fgmask_count_buffer.download(cv::Mat(1, 1, CV_32SC1, &fgmask_count), stream);
+    fgmask_count_event.record(stream);
+
+    // Prepare the color accumulator in the same way, while the fgmask calculation is taking place
+
+    input_frame.convertTo(color_wide, CV_32SC4, stream);
+    if (accumulator_count == 0) {
+        color_wide.copyTo(color_accum_next, stream);
+    }
+    else {
+        cv::cuda::add(color_accum, color_wide, color_accum_next, cv::noArray(), CV_32SC4, stream);
+    }
+}
+
+bool VideoSummary::VideoSummaryImpl::canSkipOpticalFlow()
+{
+    fgmask_count_event.waitForCompletion();
+    return fgmask_count < fgmask_threshold;
+}
+
+void VideoSummary::VideoSummaryImpl::calcOpticalFlow(cv::cuda::Stream &stream)
+{
+    // Optical flow does not use color information
+    cv::cuda::cvtColor(input_frame, input_gray, cv::COLOR_BGRA2GRAY, 0, stream);
+
+    // Run at a reduced resolution to save time and decrease noise
+    cv::cuda::resize(input_gray, flow_input_frame, cv::Size(0, 0), FLOW_IMAGE_SCALE, FLOW_IMAGE_SCALE, cv::INTER_AREA, stream);
+
+    if (flow_reference_frame.empty()) {
+        // No reference yet. Assume no motion for now, set a trivial reference so this isn't a special case
+        flow_input_frame.copyTo(flow_reference_frame, stream);
+    }
+
+    flow_algorithm->calc(flow_reference_frame, flow_input_frame, flowvec, stream);
+    cv::cuda::magnitudeSqr(flowvec, flowvec_magsqr, stream);
+    count_optical_flow++;
+
+    // Apply the combined foreground mask plus fgmask accumulator
+    cv::cuda::multiply(flowvec_magsqr, fgmask_accum_next, flowvec_masked, 1.0 / (1 + accumulator_count), -1, stream);
+
+    // Motion total is average of values squared; calculate it asynchronously
+    cv::cuda::calcSum(flowvec_masked, flowvec_sqrsum_buffer, cv::noArray(), stream);
+    flowvec_sqrsum_buffer.download(cv::Mat(1, 1, CV_64FC1, &flowvec_sqrsum), stream);
+    flowvec_sqrsum_event.record(stream);
+}
+
+void VideoSummary::VideoSummaryImpl::finishMotionSum()
+{
+    // Wait for the squared magnitude. Adjust it according to the number of pixels,
+    // so that we're measuring average of the square, and also according to the
+    // square of the downscale level, since that changes the length of the measured vectors.
+
+    flowvec_sqrsum_event.waitForCompletion();
+    double average_of_square = flowvec_sqrsum / (double)flowvec_masked.size().area();
+    double scale_squared = FLOW_IMAGE_SCALE * FLOW_IMAGE_SCALE;
+    last_motion_sum = average_of_square * scale_squared;        
+}
+
+void VideoSummary::VideoSummaryImpl::printCurrentFrameNumbers()
+{
+    std::cout
+        << "#" << input_file_index
+        << " " << count_output_frames
+        << "/" << count_input_frames;
+}
+
+void VideoSummary::VideoSummaryImpl::commitAccumulator()
+{
+    // To commit to including the current frame in the accumulator
+    // rather than discarding, we swap the buffers and increment the count.
+    accumulator_count++;
+    color_accum_next.swap(color_accum);
+    fgmask_accum_next.swap(fgmask_accum);
+}
+
+void VideoSummary::VideoSummaryImpl::resetAccumulatorToSingleFrame()
+{
+    accumulator_count = 1;
+    fgmask_wide.swap(fgmask_accum);
+    color_wide.swap(color_accum);
+    flow_input_frame.swap(flow_reference_frame);
+}
+
+void VideoSummary::VideoSummaryImpl::run(cv::cuda::Stream &stream)
+{
+    inputRead();
+    outputBegin();
+    initThreshold();
+    initAlgorithms();
+
+    while (!end_of_input) {
+
+        calcForeground(stream);
+        bool skipFlow = canSkipOpticalFlow();
+
+        if (opt.verbose && opt.debug) {
+            printCurrentFrameNumbers();
+            std::cout
+                << " fg=" << fgmask_count
+                << " skip=" << skipFlow
+                << std::endl;
+        }
+
+        if (canSkipOpticalFlow()) {
+            // Current frame has too little motion to run optical flow. 
+            // Early out. Commit the accumulator and prepare another frame.
+
+            commitAccumulator();
+            inputRead();
+            continue;
+        }
+
+        // Keep the GPU busy by preparing the next frame while we wait on the motion sum.
+        // This will overwrite input_frame with the next frame, while the other buffers
+        // still refer to the current frame for a while.
+
+        calcOpticalFlow(stream);
+        inputRead();
+        finishMotionSum();
+
+        if (opt.verbose && opt.debug) {
+            printCurrentFrameNumbers();
+            std::cout
+                << " ~" << last_motion_sum
+                << std::endl;
+        }
+
+        if (last_motion_sum < opt.threshold) {
+            // Not enough motion yet; keep this frame in the accumulator, move on.
+            commitAccumulator();
+            continue;
+        }
+
+        // This frame meets or exceeds the motion threshold.
+        // The current accumulator contents become an output frame, 
+        // and this frame starts the next accumulator and becomes the next motion reference.
+
+        outputWrite(stream);
+        resetAccumulatorToSingleFrame();
+
+        if (opt.verbose) {
+            printCurrentFrameNumbers();
+            std::cout
+                << " f" << count_optical_flow
+                << " x" << last_accumulator_count
+                << " ~" << last_motion_sum
+                << std::endl;
+        }
+    }
 }
 

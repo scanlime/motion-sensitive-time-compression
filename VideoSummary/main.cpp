@@ -40,9 +40,6 @@ int main(int argc, char **argv)
             cerr << "ERROR: Input file can't be opened, " << filename << endl;
             any_inputs_failed = true;
         }
-        else {
-            teststream.close();
-        }
     });
     if (any_inputs_failed) {
         return 1;
@@ -76,7 +73,7 @@ int main(int argc, char **argv)
 
         name << "." << output_extension;
 
-        opts.output_file = filesystem::path(opts.output_file).replace_filename(name.str()).string();
+        opts.output_file = (filesystem::path(opts.output_file) / name.str()).make_preferred().string();
     }
 
     // If the output already exists, it's an error unless we allow overwrite
@@ -86,6 +83,14 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    VideoSummary::run(opts);
+    try {
+        VideoSummary::run(opts);
+    } 
+    catch (const std::exception &err) {
+        cerr << "ERROR: " << err.what() << endl;
+        return 1;
+    }
+
+    cout << "done." << endl;
     return 0;
 }
