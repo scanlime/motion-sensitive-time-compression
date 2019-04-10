@@ -54,23 +54,33 @@ int main(int argc, char **argv)
     if (opts.output_file.empty() || filesystem::is_directory(opts.output_file)) {
         ostringstream name;
 
+        // Start with a timestamp and an identifying prefix
         tm tm;
         time_t t = std::time(0);
         localtime_s(&tm, &t);
         name << put_time(&tm, "summary-%Y%m%d%H%M%S-");
-   
+
+        // Include the name of the first input, without extensions or path
         filesystem::path input_base = filesystem::path(opts.input_files[0]).filename();
         while (input_base.has_extension()) {
             input_base.replace_extension();
         }
         name << input_base.string();
 
+        // If we're processing multiple files, count them
+        if (opts.input_files.size() > 1) {
+            name << "-n" << opts.input_files.size();
+        }
+
+        // Include the threshold value
         name << "-t" << opts.threshold;
 
+        // Optional debug marker
         if (opts.debug) {
             name << "-d";
         }
-
+      
+        // Fixed extension
         name << "." << output_extension;
 
         opts.output_file = (filesystem::path(opts.output_file) / name.str()).make_preferred().string();
