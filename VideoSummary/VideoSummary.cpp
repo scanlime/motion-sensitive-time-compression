@@ -10,7 +10,7 @@ VideoSummary::Options::Options() :
 
 namespace VideoSummary {
     static const double FLOW_IMAGE_SCALE = 1 / 3.0;
-    static const double FGMASK_THRESHOLD_CONST = 2e-4;
+    static const double FGMASK_THRESHOLD_CONST = 2e-5;
     static const int DEBUG_HEIGHT_MULTIPLE = 3;
     static const int BUFFER_STACK_SIZE = 64 * 1024 * 1024;
     static const int BUFFER_STACK_COUNT = 8;
@@ -251,7 +251,7 @@ void VideoSummary::VideoSummaryImpl::initThreshold()
     // is based on the overall motion threshold and number of pixels
 
     fgmask_threshold = std::max<int>(1, int(
-        opt.threshold * frame_size.area() * FLOW_IMAGE_SCALE * FGMASK_THRESHOLD_CONST));
+        opt.threshold * frame_size.area() * FGMASK_THRESHOLD_CONST));
 
     if (opt.verbose) {
         std::cout << "threshold = " << opt.threshold << std::endl;
@@ -274,6 +274,13 @@ void VideoSummary::VideoSummaryImpl::calcForeground(cv::cuda::Stream &stream)
     // Eroded foreground mask to look for masses of pixels rather than speckles
     bg_erode->apply(fgmask, fgmask_eroded, stream);
 
+    // Asynchronously start preparing a count of how many foreground pixels are set in the mask
+    // for the current frame only. This will be used later as an early out to skip running optical
+    // flow on frames that won't have enough motion.
+    cv::cuda::countNonZero(fgmask_eroded, fgmask_count_buffer, stream);
+    fgmask_count_buffer.download(cv::Mat(1, 1, CV_32SC1, &fgmask_count), stream);
+    fgmask_count_event.record(stream);
+
     // Scale down a version of the eroded foreground mask to match the size of our optical flow source
     cv::cuda::resize(fgmask_eroded, fgmask_eroded_scaled, cv::Size(0, 0), FLOW_IMAGE_SCALE, FLOW_IMAGE_SCALE, cv::INTER_AREA, stream);
 
@@ -290,14 +297,6 @@ void VideoSummary::VideoSummaryImpl::calcForeground(cv::cuda::Stream &stream)
     else {
         cv::cuda::add(fgmask_accum, fgmask_wide, fgmask_accum_next, cv::noArray(), CV_32FC1, stream);
     }
-
-    // Asynchronously start preparing a count of how many foreground pixels are set in the combined
-    // mask for the current frame and the contents of the accumulator.
-    // This will be used later as an early out to skip running optical flow on frames that won't have
-    // enough motion but we also don't want this operation to stall the pipeline entirely.
-    cv::cuda::countNonZero(fgmask_accum_next, fgmask_count_buffer, stream);
-    fgmask_count_buffer.download(cv::Mat(1, 1, CV_32SC1, &fgmask_count), stream);
-    fgmask_count_event.record(stream);
 
     // Prepare the color accumulator in the same way, while the fgmask calculation is taking place
 
