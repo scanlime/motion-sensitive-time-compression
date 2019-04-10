@@ -11,11 +11,6 @@ int main(int argc, char **argv)
     const std::string output_extension = "avi";
 
     auto cli = (
-        values("inputs", opts.input_files) % "One or more video files to process sequentially",
-        option("-o", "--output") & value("output", opts.output_file) % (
-            "Use a specific output file or output directory; "
-            "If this is a directory, the name will be chosen automatically. "
-            "Defaults to the same directory as the first input file."),
         option("-t", "--threshold") & value("threshold", opts.threshold) % (
             "Change the per-frame motion threshold [default = "
             + to_string(opts.threshold) + "]"),
@@ -24,7 +19,12 @@ int main(int argc, char **argv)
             + to_string(opts.output_fps) + "]"),
         option("-q", "--quiet").set(opts.verbose, false) % "Suppress normal status output",
         option("-d", "--debug").set(opts.debug) % "Generate a larger output frame that visualizes algorithm results",
-        option("-y", "--overwrite").set(allow_overwrite) % "Overwrite output file if it exists"
+        option("-y", "--overwrite").set(allow_overwrite) % "Overwrite output file if it exists",
+        option("-o", "--output") & value("output", opts.output_file) % (
+            "Use a specific output file or output directory; "
+            "If this is a directory, the name will be chosen automatically. "
+            "Defaults to the same directory as the first input file."),
+        values("inputs", opts.input_files) % "One or more video files to process sequentially"
         );
 
     if (!parse(argc, argv, cli) || opts.input_files.empty()) {
