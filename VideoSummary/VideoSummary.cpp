@@ -10,10 +10,10 @@ VideoSummary::Options::Options() :
 
 namespace VideoSummary {
     static const double FLOW_IMAGE_SCALE = 1 / 3.0;
-    static const double FGMASK_THRESHOLD_CONST = 1e-3;
+    static const double FGMASK_THRESHOLD_CONST = 8e-4;
     static const int DEBUG_HEIGHT_MULTIPLE = 3;
-    static const int BUFFER_STACK_SIZE = 64 * 1024 * 1024;
-    static const int BUFFER_STACK_COUNT = 8;
+    static const int BUFFER_STACK_SIZE = 16 * 1024 * 1024;
+    static const int BUFFER_STACK_COUNT = 6;
 
     class VideoSummaryImpl {
     public:
@@ -176,7 +176,7 @@ void VideoSummary::VideoSummaryImpl::outputBegin()
 
 	output_writer.open(opt.output_file,
 		cv::CAP_FFMPEG,
-		cv::VideoWriter::fourcc('a', 'v', 'c', '1'),
+		cv::VideoWriter::fourcc('H', '2', '6', '4'),
         opt.output_fps, output_size);
 }
 
