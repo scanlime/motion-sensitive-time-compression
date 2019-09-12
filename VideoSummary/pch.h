@@ -18,7 +18,6 @@
 
 // OpenCV 4 with CUDA
 #include <opencv2/cudaarithm.hpp>
-#include <opencv2/videoio.hpp>
 #include <opencv2/cudaoptflow.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/imgproc.hpp>

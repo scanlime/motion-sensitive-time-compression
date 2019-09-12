@@ -54,14 +54,14 @@ namespace VideoSummary {
         cv::cuda::Event flowvec_sqrsum_event;
         double flowvec_sqrsum;
 		
-        cv::VideoCapture input_reader;
+        FILE* input_reader;
 		cv::Mat input_frame;
         cv::cuda::GpuMat input_frame_gpu, input_gray;
 
         cv::cuda::GpuMat flow_input_frame, flow_reference_frame;
         cv::cuda::GpuMat flowvec, flowvec_magsqr, flowvec_masked;
 
-        cv::VideoWriter output_writer;
+        FILE* output_writer;
         cv::cuda::GpuMat output_frame;
         cv::Mat output_buffers[2];
         cv::cuda::Event output_events[2];
@@ -123,32 +123,27 @@ void VideoSummary::VideoSummaryImpl::inputRead()
         }
 
         // Switching files
-        if (!input_reader.isOpened()) {
+        if (!input_reader) {
             const std::string &input_file = opt.input_files[input_file_index];
-            input_reader.open(input_file);
+			const std::string cmd = "ffmpeg -nostats -i \"" + input_file + "\" -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -";
+			std::cout << cmd << std::endl;
+			input_reader = _popen(cmd.c_str(), "rb");
 
-			cv::Size frame_size(input_reader.get(cv::CAP_PROP_FRAME_WIDTH), 
-				input_reader.get(cv::CAP_PROP_FRAME_HEIGHT));
+			cv::Size frame_size(1920, 1080);
 
             if (opt.verbose) {
                 std::cout << "Input file " << input_file << " is "
                     << frame_size.width << " x " << frame_size.height << std::endl;
             }
 
-			if (!input_frame.empty() && input_frame.size() != frame_size) {
-				throw std::runtime_error("Video size changed! All inputs must be the same resolution.");
-			}
+			input_frame.create(frame_size, CV_8UC3);
+		}
 
-            if (!input_reader.read(input_frame) || input_frame.empty()) {
-                throw std::runtime_error("Failed to decode the first video frame!");
-            }
-            break;
-        }
-
-        if (input_reader.read(input_frame)) {
-            break;
-        }
+		if (1 == fread(input_frame.data, input_frame.dataend - input_frame.datastart, 1, input_reader)) {
+			break;
+		}
         else {
+			fclose(input_reader);
             input_reader = 0;
             input_file_index++;
         }
@@ -174,10 +169,11 @@ void VideoSummary::VideoSummaryImpl::outputBegin()
             << std::endl;
     }
 
-	output_writer.open(opt.output_file,
-		cv::CAP_FFMPEG,
-		cv::VideoWriter::fourcc('H', '2', '6', '4'),
-        opt.output_fps, output_size);
+	const std::string cmd = "ffmpeg -nostats -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -r 30 -video_size " 
+		+ std::to_string(output_size.width) + "x" + std::to_string(output_size.height)
+		+ " -i - -vcodec prores_ks -profile:v 3 \"" + opt.output_file + "\"";
+	std::cout << cmd << std::endl;
+	output_writer = _popen(cmd.c_str(), "wb");
 }
 
 void VideoSummary::VideoSummaryImpl::outputWrite(cv::cuda::Stream &stream)
@@ -227,7 +223,8 @@ void VideoSummary::VideoSummaryImpl::outputWrite(cv::cuda::Stream &stream)
     if (count_output_frames > 0) {
         // Complete the previous frame on the CPU side, hopefully without blocking
         output_events[!this_buffer].waitForCompletion();
-        output_writer.write(output_buffers[!this_buffer]);
+		cv::Mat& buf = output_buffers[!this_buffer];
+		fwrite(buf.datastart, buf.dataend - buf.datastart, 1, output_writer);
     }
     count_output_frames++;
 }
