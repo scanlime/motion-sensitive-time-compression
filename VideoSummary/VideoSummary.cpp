@@ -171,7 +171,7 @@ void VideoSummary::VideoSummaryImpl::outputBegin()
 
 	const std::string cmd = "ffmpeg -nostats -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -r 30 -video_size " 
 		+ std::to_string(output_size.width) + "x" + std::to_string(output_size.height)
-		+ " -i - -vcodec prores_ks -profile:v 3 \"" + opt.output_file + "\"";
+		+ " -i - -vf format=yuv422p10 -vcodec prores -profile:v 3 \"" + opt.output_file + "\"";
 	std::cout << cmd << std::endl;
 	output_writer = _popen(cmd.c_str(), "wb");
 }
