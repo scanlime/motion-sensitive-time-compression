@@ -125,7 +125,7 @@ void VideoSummary::VideoSummaryImpl::inputRead()
         // Switching files
         if (!input_reader) {
             const std::string &input_file = opt.input_files[input_file_index];
-			const std::string cmd = "ffmpeg -nostats -i \"" + input_file + "\" -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -";
+			const std::string cmd = "ffmpeg -hwaccel cuvid -nostats -i \"" + input_file + "\" -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -";
 			std::cout << cmd << std::endl;
 			input_reader = _popen(cmd.c_str(), "rb");
 
