@@ -43,8 +43,8 @@ namespace VideoSummary {
 
         cv::cuda::GpuMat color_wide, color_accum, color_accum_next;
 
-        cv::cuda::GpuMat debug_fgmask_rgbx, debug_fgmask_gray;
-        cv::cuda::GpuMat debug_flow_rgbx, debug_flow_gray;
+        cv::cuda::GpuMat debug_fgmask_rgb, debug_fgmask_gray;
+        cv::cuda::GpuMat debug_flow_rgb, debug_flow_gray;
 
         cv::cuda::GpuMat fgmask_count_buffer;
         cv::cuda::Event fgmask_count_event;
@@ -53,9 +53,10 @@ namespace VideoSummary {
         cv::cuda::GpuMat flowvec_sqrsum_buffer;
         cv::cuda::Event flowvec_sqrsum_event;
         double flowvec_sqrsum;
-
-        cv::Ptr<cv::cudacodec::VideoReader> input_reader;
-        cv::cuda::GpuMat input_frame, input_uncropped, input_gray;
+		
+        cv::VideoCapture input_reader;
+		cv::Mat input_frame;
+        cv::cuda::GpuMat input_frame_gpu, input_gray;
 
         cv::cuda::GpuMat flow_input_frame, flow_reference_frame;
         cv::cuda::GpuMat flowvec, flowvec_magsqr, flowvec_masked;
@@ -122,37 +123,29 @@ void VideoSummary::VideoSummaryImpl::inputRead()
         }
 
         // Switching files
-        if (input_reader.empty()) {
+        if (!input_reader.isOpened()) {
             const std::string &input_file = opt.input_files[input_file_index];
-            input_reader = cv::cudacodec::createVideoReader(input_file);
-            cv::cudacodec::FormatInfo format = input_reader->format();
+            input_reader.open(input_file);
 
-            cv::Size frame_size(format.width, format.height);
-            if (frame_size == cv::Size(1920, 1088)) {
-                // Workaround for a bug in cudacodec, size rounded up to the next multiple of 16.
-                // This fix is just a hack specific to 1080p video.
-                frame_size.height = 1080;
-            }
+			cv::Size frame_size(input_reader.get(cv::CAP_PROP_FRAME_WIDTH), 
+				input_reader.get(cv::CAP_PROP_FRAME_HEIGHT));
 
             if (opt.verbose) {
                 std::cout << "Input file " << input_file << " is "
                     << frame_size.width << " x " << frame_size.height << std::endl;
             }
 
-            if (!input_reader->nextFrame(input_uncropped) || input_uncropped.empty()) {
+			if (!input_frame.empty() && input_frame.size() != frame_size) {
+				throw std::runtime_error("Video size changed! All inputs must be the same resolution.");
+			}
+
+            if (!input_reader.read(input_frame) || input_frame.empty()) {
                 throw std::runtime_error("Failed to decode the first video frame!");
             }
-
-            if (!input_frame.empty() && input_frame.size() != frame_size) {
-                throw std::runtime_error("Video size changed! All inputs must be the same resolution.");
-            }
-
-            // Reference our cropped area of the full decoded frame without copying
-            input_frame = input_uncropped(cv::Rect(cv::Point(0, 0), frame_size));
             break;
         }
 
-        if (input_reader->nextFrame(input_uncropped)) {
+        if (input_reader.read(input_frame)) {
             break;
         }
         else {
@@ -173,7 +166,7 @@ void VideoSummary::VideoSummaryImpl::outputBegin()
     cv::Size debug_size(input_size.width, input_size.height * DEBUG_HEIGHT_MULTIPLE);
     cv::Size output_size = opt.debug ? debug_size : input_size;
 
-    output_frame.create(output_size, CV_8UC4);
+    output_frame.create(output_size, CV_8UC3);
 
     if (opt.verbose) {
         std::cout << "Writing " << opt.output_file
@@ -181,9 +174,9 @@ void VideoSummary::VideoSummaryImpl::outputBegin()
             << std::endl;
     }
 
-    output_writer.open(opt.output_file,
-        cv::CAP_FFMPEG,
-        cv::VideoWriter::fourcc('H', '2', '6', '4'),
+	output_writer.open(opt.output_file,
+		cv::CAP_FFMPEG,
+		cv::VideoWriter::fourcc('a', 'v', 'c', '1'),
         opt.output_fps, output_size);
 }
 
@@ -211,20 +204,20 @@ void VideoSummary::VideoSummaryImpl::outputWrite(cv::cuda::Stream &stream)
         cv::cuda::normalize(fgmask_accum_next, debug_fgmask_gray, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
         cv::cuda::normalize(flowvec_masked, debug_flow_gray, 0, 3 * 255, cv::NORM_MINMAX, CV_8UC1, cv::noArray(), stream);
 
-        // Grayscale (normalized) to RGBX to match output
-        cv::cuda::cvtColor(debug_fgmask_gray, debug_fgmask_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
-        cv::cuda::cvtColor(debug_flow_gray, debug_flow_rgbx, cv::COLOR_GRAY2BGRA, 4, stream);
+        // Grayscale (normalized) to RGB to match output
+        cv::cuda::cvtColor(debug_fgmask_gray, debug_fgmask_rgb, cv::COLOR_GRAY2BGR, 4, stream);
+        cv::cuda::cvtColor(debug_flow_gray, debug_flow_rgb, cv::COLOR_GRAY2BGR, 4, stream);
 
         // Low res debug frames on bottom, scaled up to match
-        cv::cudev::resize(debug_fgmask_rgbx, debug_frames[1], debug_frames[1].size(), 0, 0, cv::INTER_LINEAR, stream);
-        cv::cudev::resize(debug_flow_rgbx, debug_frames[2], debug_frames[2].size(), 0, 0, cv::INTER_LINEAR, stream);
+        cv::cudev::resize(debug_fgmask_rgb, debug_frames[1], debug_frames[1].size(), 0, 0, cv::INTER_LINEAR, stream);
+        cv::cudev::resize(debug_flow_rgb, debug_frames[2], debug_frames[2].size(), 0, 0, cv::INTER_LINEAR, stream);
     }
     else {
         color_output_ref = output_frame;
     }
 
     // Convert accumulator to 8U
-    color_accum.convertTo(color_output_ref, CV_8UC4, 1.0 / accumulator_count, stream);
+    color_accum.convertTo(color_output_ref, CV_8UC3, 1.0 / accumulator_count, stream);
 
     // Async download
     unsigned this_buffer = count_output_frames % 2;
@@ -234,9 +227,7 @@ void VideoSummary::VideoSummaryImpl::outputWrite(cv::cuda::Stream &stream)
     if (count_output_frames > 0) {
         // Complete the previous frame on the CPU side, hopefully without blocking
         output_events[!this_buffer].waitForCompletion();
-        cv::Mat rgb, &rgbx = output_buffers[!this_buffer];
-        cv::cvtColor(rgbx, rgb, cv::COLOR_BGRA2BGR);
-        output_writer.write(rgb);
+        output_writer.write(output_buffers[!this_buffer]);
     }
     count_output_frames++;
 }
@@ -251,8 +242,9 @@ void VideoSummary::VideoSummaryImpl::initThreshold()
     // take an early out if the number of total foreground pixels is too low. This threshold
     // is based on the overall motion threshold and number of pixels
 
-    fgmask_threshold = std::max<int>(1, int(
-        opt.threshold * fgmask_area * FGMASK_THRESHOLD_CONST));
+    fgmask_threshold = opt.threshold ? std::max<int>(1, int(
+        opt.threshold * fgmask_area * FGMASK_THRESHOLD_CONST))
+        : 0;
 
     if (opt.verbose) {
         std::cout << "threshold = " << opt.threshold << std::endl;
@@ -269,8 +261,10 @@ void VideoSummary::VideoSummaryImpl::initAlgorithms()
 
 void VideoSummary::VideoSummaryImpl::calcForeground(cv::cuda::Stream &stream)
 {
+	input_frame_gpu.upload(input_frame, stream);
+
     // Update a background subtractor model with the original-rate video
-    bg_algorithm->apply(input_frame, fgmask, -1, stream);
+    bg_algorithm->apply(input_frame_gpu, fgmask, -1, stream);
 
     // Eroded foreground mask to look for masses of pixels rather than speckles
     bg_erode->apply(fgmask, fgmask_eroded, stream);
@@ -301,12 +295,12 @@ void VideoSummary::VideoSummaryImpl::calcForeground(cv::cuda::Stream &stream)
 
     // Prepare the color accumulator in the same way, while the fgmask calculation is taking place
 
-    input_frame.convertTo(color_wide, CV_32SC4, stream);
+    input_frame_gpu.convertTo(color_wide, CV_32SC3, stream);
     if (accumulator_count == 0) {
         color_wide.copyTo(color_accum_next, stream);
     }
     else {
-        cv::cuda::add(color_accum, color_wide, color_accum_next, cv::noArray(), CV_32SC4, stream);
+        cv::cuda::add(color_accum, color_wide, color_accum_next, cv::noArray(), CV_32SC3, stream);
     }
 }
 
@@ -319,7 +313,7 @@ bool VideoSummary::VideoSummaryImpl::canSkipOpticalFlow()
 void VideoSummary::VideoSummaryImpl::calcOpticalFlow(cv::cuda::Stream &stream)
 {
     // Optical flow does not use color information
-    cv::cuda::cvtColor(input_frame, input_gray, cv::COLOR_BGRA2GRAY, 0, stream);
+    cv::cuda::cvtColor(input_frame_gpu, input_gray, cv::COLOR_BGR2GRAY, 0, stream);
 
     // Run at a reduced resolution to save time and decrease noise
     cv::cuda::resize(input_gray, flow_input_frame, cv::Size(0, 0), FLOW_IMAGE_SCALE, FLOW_IMAGE_SCALE, cv::INTER_AREA, stream);
@@ -349,9 +343,13 @@ void VideoSummary::VideoSummaryImpl::finishMotionSum()
     // square of the downscale level, since that changes the length of the measured vectors.
 
     flowvec_sqrsum_event.waitForCompletion();
-    double average_of_square = flowvec_sqrsum / (double)flowvec_masked.size().area();
+    double sqrsum = flowvec_sqrsum;
+    assert(sqrsum >= 0.0);
+
+    double average_of_square = sqrsum / (double)flowvec_masked.size().area();
     double scale_squared = FLOW_IMAGE_SCALE * FLOW_IMAGE_SCALE;
-    last_motion_sum = average_of_square * scale_squared;        
+    last_motion_sum = average_of_square * scale_squared;       
+    assert(last_motion_sum >= 0.0);
 }
 
 void VideoSummary::VideoSummaryImpl::printCurrentFrameNumbers()
