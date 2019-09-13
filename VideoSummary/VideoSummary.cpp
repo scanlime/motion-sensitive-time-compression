@@ -116,6 +116,8 @@ void VideoSummary::run(const VideoSummary::Options &opt)
 
 void VideoSummary::VideoSummaryImpl::inputRead()
 {
+	HANDLE os_input_reader = INVALID_HANDLE_VALUE;
+
     while (!end_of_input) {
         if (input_file_index >= opt.input_files.size()) {
             end_of_input = true;
@@ -125,10 +127,13 @@ void VideoSummary::VideoSummaryImpl::inputRead()
         // Switching files
         if (!input_reader) {
             const std::string &input_file = opt.input_files[input_file_index];
-			const std::string cmd = "ffmpeg -hwaccel cuvid -nostats -i \"" + input_file + "\" -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -";
+			const std::string cmd = "ffmpeg -hwaccel qsv -nostats -i \"" + input_file + "\" -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -";
 			std::cout << cmd << std::endl;
 			input_reader = _popen(cmd.c_str(), "rb");
+			setvbuf(input_reader, 0, _IONBF, 0);
+			os_input_reader = INVALID_HANDLE_VALUE;
 
+			// fix me: probe resolution (and frame rate?)
 			cv::Size frame_size(1920, 1080);
 
             if (opt.verbose) {
@@ -139,14 +144,30 @@ void VideoSummary::VideoSummaryImpl::inputRead()
 			input_frame.create(frame_size, CV_8UC3);
 		}
 
-		if (1 == fread(input_frame.data, input_frame.dataend - input_frame.datastart, 1, input_reader)) {
+		// Use low level reads in an attempt to reduce overhead due to FILE* buffering in this read
+		if (os_input_reader == INVALID_HANDLE_VALUE) {
+			int fd = _fileno(input_reader);
+			os_input_reader = (HANDLE)_get_osfhandle(fd);
+		}
+
+		DWORD numRead = 0;
+		DWORD limit = input_frame.dataend - input_frame.datastart;
+		DWORD offset = 0;
+
+		while (input_reader && offset < limit) {
+			if (ReadFile(os_input_reader, input_frame.data + offset, limit - offset, &numRead, 0)) {
+				offset += numRead;
+			}
+			else {
+				fclose(input_reader);
+				input_reader = 0;
+				input_file_index++;
+			}
+		}
+		if (input_reader) {
+			// finished one frame without EOF
 			break;
 		}
-        else {
-			fclose(input_reader);
-            input_reader = 0;
-            input_file_index++;
-        }
     }
 
     if (!end_of_input) {
@@ -174,6 +195,7 @@ void VideoSummary::VideoSummaryImpl::outputBegin()
 		+ " -i - -vf format=yuv422p10 -vcodec prores -profile:v 3 \"" + opt.output_file + "\"";
 	std::cout << cmd << std::endl;
 	output_writer = _popen(cmd.c_str(), "wb");
+	setvbuf(output_writer, 0, _IONBF, 0);
 }
 
 void VideoSummary::VideoSummaryImpl::outputWrite(cv::cuda::Stream &stream)

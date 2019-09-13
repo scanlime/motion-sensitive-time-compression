@@ -10,11 +10,16 @@
 #include <algorithm>
 #include <filesystem>
 
-// NVidia NPP
-#include <npp.h>
-
 // Bundled third party libraries
 #include "clipp.h"
+
+// Windows files
+#include <stdio.h>
+#include <io.h>
+#include <windows.h>
+
+// NVidia NPP
+#include <npp.h>
 
 // OpenCV 4 with CUDA
 #include <opencv2/cudaarithm.hpp>
