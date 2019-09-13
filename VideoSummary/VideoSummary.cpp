@@ -309,13 +309,15 @@ void VideoSummary::VideoSummaryImpl::calcForeground(cv::cuda::Stream &stream)
     // combined accumulator fgmask. This will be used later as an early out to skip running optical
     // flow on frames that won't have enough motion.
     cv::cuda::countNonZero(fgmask_accum_next, fgmask_count_buffer, stream);
-    fgmask_count_buffer.download(cv::Mat(1, 1, CV_32SC1, &fgmask_count), stream);
-    fgmask_count_event.record(stream);
 
     // Prepare the color accumulator in the same way, while the fgmask calculation is taking place
 
     input_frame_gpu.convertTo(color_wide, CV_32SC3, stream);
-    if (accumulator_count == 0) {
+
+	fgmask_count_buffer.download(cv::Mat(1, 1, CV_32SC1, &fgmask_count), stream);
+	fgmask_count_event.record(stream);
+
+	if (accumulator_count == 0) {
         color_wide.copyTo(color_accum_next, stream);
     }
     else {
