@@ -127,7 +127,8 @@ void VideoSummary::VideoSummaryImpl::inputRead()
         // Switching files
         if (!input_reader) {
             const std::string &input_file = opt.input_files[input_file_index];
-			const std::string cmd = "ffmpeg -hwaccel qsv -nostats -i \"" + input_file + "\" -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -";
+			const std::string cmd = "ffmpeg -hwaccel qsv -nostats -i \"" + input_file
+				+ "\" -f fifo -fifo_format rawvideo -map 0:v -vcodec rawvideo -pix_fmt rgb24 -";
 			std::cout << cmd << std::endl;
 			input_reader = _popen(cmd.c_str(), "rb");
 			setvbuf(input_reader, 0, _IONBF, 0);
@@ -192,7 +193,7 @@ void VideoSummary::VideoSummaryImpl::outputBegin()
 
 	const std::string cmd = "ffmpeg -nostats -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -r 30 -video_size " 
 		+ std::to_string(output_size.width) + "x" + std::to_string(output_size.height)
-		+ " -i - -vf format=yuv422p10 -vcodec prores -profile:v 3 \"" + opt.output_file + "\"";
+		+ " -i - -vf format=yuv422p10 -f fifo -map 0:v -vcodec prores -profile:v 3 \"" + opt.output_file + "\"";
 	std::cout << cmd << std::endl;
 	output_writer = _popen(cmd.c_str(), "wb");
 	setvbuf(output_writer, 0, _IONBF, 0);
