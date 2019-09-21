@@ -8,7 +8,7 @@ int main(int argc, char **argv)
 {
     VideoSummary::Options opts;
     bool allow_overwrite = false;
-    const std::string output_extension = "mov";
+    const std::string output_extension = "avi";
 
     auto cli = (
         option("-t", "--threshold") & value("threshold", opts.threshold) % (
