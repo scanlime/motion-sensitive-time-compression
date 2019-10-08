@@ -5,16 +5,16 @@
 
 namespace VideoSummary {
 
-	struct Options {
-		Options();
+    struct Options {
+        Options();
 
-		std::vector<std::string> input_files;
-		std::string output_file;
-		double threshold;
+        std::vector<std::string> input_files;
+        std::string output_file;
+        double threshold;
         double output_fps;
-		bool debug;
-		bool verbose;
-	};
+        bool debug;
+        bool verbose;
+    };
 
-	void run(const Options &opt);
+    void run(const Options& opt);
 };

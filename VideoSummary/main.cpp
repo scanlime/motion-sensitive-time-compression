@@ -4,7 +4,7 @@
 using namespace clipp;
 using namespace std;
 
-int main(int argc, char **argv)
+int main(int argc, char** argv)
 {
     VideoSummary::Options opts;
     bool allow_overwrite = false;
@@ -34,7 +34,7 @@ int main(int argc, char **argv)
 
     // Make sure all inputs are readable before we start
     bool any_inputs_failed = false;
-    for_each(opts.input_files.begin(), opts.input_files.end(), [&](const string &filename) {
+    for_each(opts.input_files.begin(), opts.input_files.end(), [&](const string& filename) {
         ifstream teststream(filename, ifstream::binary);
         if (teststream.fail()) {
             cerr << "ERROR: Input file can't be opened, " << filename << endl;
@@ -79,7 +79,7 @@ int main(int argc, char **argv)
         if (opts.debug) {
             name << "-d";
         }
-      
+
         // Fixed extension
         name << "." << output_extension;
 
@@ -95,8 +95,8 @@ int main(int argc, char **argv)
 
     try {
         VideoSummary::run(opts);
-    } 
-    catch (const std::exception &err) {
+    }
+    catch (const std::exception& err) {
         cerr << "ERROR: " << err.what() << endl;
         return 1;
     }

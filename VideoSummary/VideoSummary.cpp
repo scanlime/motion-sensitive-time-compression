@@ -17,18 +17,18 @@ namespace VideoSummary {
 
     class VideoSummaryImpl {
     public:
-        VideoSummaryImpl(const Options &opt);
-        void run(cv::cuda::Stream &stream);
+        VideoSummaryImpl(const Options& opt);
+        void run(cv::cuda::Stream& stream);
 
     private:
-        const Options &opt;
+        const Options& opt;
         int input_file_index;
         bool end_of_input;
 
         unsigned count_input_frames;
         unsigned count_output_frames;
         unsigned count_optical_flow;
-        
+
         int accumulator_count;
         int last_accumulator_count;
         double last_motion_sum;
@@ -53,9 +53,9 @@ namespace VideoSummary {
         cv::cuda::GpuMat flowvec_sqrsum_buffer;
         cv::cuda::Event flowvec_sqrsum_event;
         double flowvec_sqrsum;
-		
+
         FILE* input_reader;
-		cv::Mat input_frame;
+        cv::Mat input_frame;
         cv::cuda::GpuMat input_frame_gpu, input_gray;
 
         cv::cuda::GpuMat flow_input_frame, flow_reference_frame;
@@ -68,12 +68,12 @@ namespace VideoSummary {
 
         void inputRead();
         void outputBegin();
-        void outputWrite(cv::cuda::Stream &stream);
+        void outputWrite(cv::cuda::Stream& stream);
         void initThreshold();
         void initAlgorithms();
-        void calcForeground(cv::cuda::Stream &stream);
+        void calcForeground(cv::cuda::Stream& stream);
         bool canSkipOpticalFlow();
-        void calcOpticalFlow(cv::cuda::Stream &stream);
+        void calcOpticalFlow(cv::cuda::Stream& stream);
         void finishMotionSum();
         void commitAccumulator();
         void resetAccumulatorToSingleFrame();
@@ -81,7 +81,7 @@ namespace VideoSummary {
     };
 }
 
-VideoSummary::VideoSummaryImpl::VideoSummaryImpl(const Options &opt) :
+VideoSummary::VideoSummaryImpl::VideoSummaryImpl(const Options& opt) :
     opt(opt),
     input_file_index(0),
     end_of_input(false),
@@ -93,7 +93,7 @@ VideoSummary::VideoSummaryImpl::VideoSummaryImpl(const Options &opt) :
     last_motion_sum(0)
 {}
 
-void VideoSummary::run(const VideoSummary::Options &opt)
+void VideoSummary::run(const VideoSummary::Options& opt)
 {
     VideoSummaryImpl impl(opt);
 
@@ -116,7 +116,7 @@ void VideoSummary::run(const VideoSummary::Options &opt)
 
 void VideoSummary::VideoSummaryImpl::inputRead()
 {
-	HANDLE os_input_reader = INVALID_HANDLE_VALUE;
+    HANDLE os_input_reader = INVALID_HANDLE_VALUE;
 
     while (!end_of_input) {
         if (input_file_index >= opt.input_files.size()) {
@@ -126,49 +126,49 @@ void VideoSummary::VideoSummaryImpl::inputRead()
 
         // Switching files
         if (!input_reader) {
-            const std::string &input_file = opt.input_files[input_file_index];
-			const std::string cmd = "ffmpeg -hwaccel qsv -nostats -i \"" + input_file
-				+ "\" -f fifo -fifo_format rawvideo -map 0:v -vcodec rawvideo -pix_fmt rgb24 -";
-			std::cout << cmd << std::endl;
-			input_reader = _popen(cmd.c_str(), "rb");
-			setvbuf(input_reader, 0, _IONBF, 0);
-			os_input_reader = INVALID_HANDLE_VALUE;
+            const std::string& input_file = opt.input_files[input_file_index];
+            const std::string cmd = "ffmpeg -hwaccel qsv -nostats -i \"" + input_file
+                + "\" -f fifo -fifo_format rawvideo -map 0:v -vcodec rawvideo -pix_fmt rgb24 -";
+            std::cout << cmd << std::endl;
+            input_reader = _popen(cmd.c_str(), "rb");
+            setvbuf(input_reader, 0, _IONBF, 0);
+            os_input_reader = INVALID_HANDLE_VALUE;
 
-			// fix me: probe resolution (and frame rate?)
-			cv::Size frame_size(1920, 1080);
+            // fix me: probe resolution (and frame rate?)
+            cv::Size frame_size(1920, 1080);
 
             if (opt.verbose) {
                 std::cout << "Input file " << input_file << " is "
                     << frame_size.width << " x " << frame_size.height << std::endl;
             }
 
-			input_frame.create(frame_size, CV_8UC3);
-		}
+            input_frame.create(frame_size, CV_8UC3);
+        }
 
-		// Use low level reads in an attempt to reduce overhead due to FILE* buffering in this read
-		if (os_input_reader == INVALID_HANDLE_VALUE) {
-			int fd = _fileno(input_reader);
-			os_input_reader = (HANDLE)_get_osfhandle(fd);
-		}
+        // Use low level reads in an attempt to reduce overhead due to FILE* buffering in this read
+        if (os_input_reader == INVALID_HANDLE_VALUE) {
+            int fd = _fileno(input_reader);
+            os_input_reader = (HANDLE)_get_osfhandle(fd);
+        }
 
-		DWORD numRead = 0;
-		DWORD limit = input_frame.dataend - input_frame.datastart;
-		DWORD offset = 0;
+        DWORD numRead = 0;
+        DWORD limit = input_frame.dataend - input_frame.datastart;
+        DWORD offset = 0;
 
-		while (input_reader && offset < limit) {
-			if (ReadFile(os_input_reader, input_frame.data + offset, limit - offset, &numRead, 0)) {
-				offset += numRead;
-			}
-			else {
-				fclose(input_reader);
-				input_reader = 0;
-				input_file_index++;
-			}
-		}
-		if (input_reader) {
-			// finished one frame without EOF
-			break;
-		}
+        while (input_reader && offset < limit) {
+            if (ReadFile(os_input_reader, input_frame.data + offset, limit - offset, &numRead, 0)) {
+                offset += numRead;
+            }
+            else {
+                fclose(input_reader);
+                input_reader = 0;
+                input_file_index++;
+            }
+        }
+        if (input_reader) {
+            // finished one frame without EOF
+            break;
+        }
     }
 
     if (!end_of_input) {
@@ -191,15 +191,15 @@ void VideoSummary::VideoSummaryImpl::outputBegin()
             << std::endl;
     }
 
-	const std::string cmd = "ffmpeg -nostats -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -r 30 -video_size " 
-		+ std::to_string(output_size.width) + "x" + std::to_string(output_size.height)
-		+ " -i - -f fifo -map 0:v -vcodec libx264 -crf 18 \"" + opt.output_file + "\"";
-	std::cout << cmd << std::endl;
-	output_writer = _popen(cmd.c_str(), "wb");
-	setvbuf(output_writer, 0, _IONBF, 0);
+    const std::string cmd = "ffmpeg -nostats -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -r 30 -video_size "
+        + std::to_string(output_size.width) + "x" + std::to_string(output_size.height)
+        + " -i - -f fifo -map 0:v -vcodec libx264 -crf 18 \"" + opt.output_file + "\"";
+    std::cout << cmd << std::endl;
+    output_writer = _popen(cmd.c_str(), "wb");
+    setvbuf(output_writer, 0, _IONBF, 0);
 }
 
-void VideoSummary::VideoSummaryImpl::outputWrite(cv::cuda::Stream &stream)
+void VideoSummary::VideoSummaryImpl::outputWrite(cv::cuda::Stream& stream)
 {
     if (accumulator_count < 1) {
         return;
@@ -246,8 +246,8 @@ void VideoSummary::VideoSummaryImpl::outputWrite(cv::cuda::Stream &stream)
     if (count_output_frames > 0) {
         // Complete the previous frame on the CPU side, hopefully without blocking
         output_events[!this_buffer].waitForCompletion();
-		cv::Mat& buf = output_buffers[!this_buffer];
-		fwrite(buf.datastart, buf.dataend - buf.datastart, 1, output_writer);
+        cv::Mat& buf = output_buffers[!this_buffer];
+        fwrite(buf.datastart, buf.dataend - buf.datastart, 1, output_writer);
     }
     count_output_frames++;
 }
@@ -279,9 +279,9 @@ void VideoSummary::VideoSummaryImpl::initAlgorithms()
     bg_erode = cv::cuda::createMorphologyFilter(cv::MORPH_ERODE, CV_8UC1, cv::Mat::ones(cv::Size(3, 3), CV_8UC1));
 }
 
-void VideoSummary::VideoSummaryImpl::calcForeground(cv::cuda::Stream &stream)
+void VideoSummary::VideoSummaryImpl::calcForeground(cv::cuda::Stream& stream)
 {
-	input_frame_gpu.upload(input_frame, stream);
+    input_frame_gpu.upload(input_frame, stream);
 
     // Update a background subtractor model with the original-rate video
     bg_algorithm->apply(input_frame_gpu, fgmask, -1, stream);
@@ -315,10 +315,10 @@ void VideoSummary::VideoSummaryImpl::calcForeground(cv::cuda::Stream &stream)
 
     input_frame_gpu.convertTo(color_wide, CV_32SC3, stream);
 
-	fgmask_count_buffer.download(cv::Mat(1, 1, CV_32SC1, &fgmask_count), stream);
-	fgmask_count_event.record(stream);
+    fgmask_count_buffer.download(cv::Mat(1, 1, CV_32SC1, &fgmask_count), stream);
+    fgmask_count_event.record(stream);
 
-	if (accumulator_count == 0) {
+    if (accumulator_count == 0) {
         color_wide.copyTo(color_accum_next, stream);
     }
     else {
@@ -332,7 +332,7 @@ bool VideoSummary::VideoSummaryImpl::canSkipOpticalFlow()
     return fgmask_count < fgmask_threshold;
 }
 
-void VideoSummary::VideoSummaryImpl::calcOpticalFlow(cv::cuda::Stream &stream)
+void VideoSummary::VideoSummaryImpl::calcOpticalFlow(cv::cuda::Stream& stream)
 {
     // Optical flow does not use color information
     cv::cuda::cvtColor(input_frame_gpu, input_gray, cv::COLOR_BGR2GRAY, 0, stream);
@@ -370,7 +370,7 @@ void VideoSummary::VideoSummaryImpl::finishMotionSum()
 
     double average_of_square = sqrsum / (double)flowvec_masked.size().area();
     double scale_squared = FLOW_IMAGE_SCALE * FLOW_IMAGE_SCALE;
-    last_motion_sum = average_of_square * scale_squared;       
+    last_motion_sum = average_of_square * scale_squared;
     assert(last_motion_sum >= 0.0);
 }
 
@@ -399,7 +399,7 @@ void VideoSummary::VideoSummaryImpl::resetAccumulatorToSingleFrame()
     flow_input_frame.swap(flow_reference_frame);
 }
 
-void VideoSummary::VideoSummaryImpl::run(cv::cuda::Stream &stream)
+void VideoSummary::VideoSummaryImpl::run(cv::cuda::Stream& stream)
 {
     inputRead();
     outputBegin();
