@@ -368,8 +368,8 @@ void VideoSummary::VideoSummaryImpl::finishMotionSum()
 void VideoSummary::VideoSummaryImpl::printCurrentFrameNumbers()
 {
     std::cout
-        << "#" << input_file_index
-        << " " << count_output_frames
+        << "[" << opt.input_files[input_file_index]
+        << "] " << count_output_frames
         << "/" << count_input_frames;
 }
 
