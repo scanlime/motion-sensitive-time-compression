@@ -10,7 +10,8 @@ namespace VideoSummary {
 
         std::vector<std::string> input_files;
         std::string output_file;
-        double threshold;
+        double motion_threshold;
+        double area_threshold;
         double output_fps;
         bool debug;
         bool verbose;

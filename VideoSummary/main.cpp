@@ -11,9 +11,12 @@ int main(int argc, char** argv)
     const std::string output_extension = "avi";
 
     auto cli = (
-        option("-t", "--threshold") & value("threshold", opts.threshold) % (
+        option("-t", "--motion-threshold") & value("motion_threshold", opts.motion_threshold) % (
             "Change the per-frame motion threshold [default = "
-            + to_string(opts.threshold) + "]"),
+            + to_string(opts.motion_threshold) + "]"),
+        option("-a", "--area-threshold") & value("area_threshold", opts.area_threshold) % (
+            "Change the foreground area threshold [default = "
+            + to_string(opts.area_threshold) + "]"),
         option("-r", "--fps") & value("rate", opts.output_fps) % (
             "Set the frame rate used by the output file [default = "
             + to_string(opts.output_fps) + "]"),
@@ -72,8 +75,8 @@ int main(int argc, char** argv)
             name << "-n" << opts.input_files.size();
         }
 
-        // Include the threshold value
-        name << "-t" << opts.threshold;
+        // Include the motion threshold
+        name << "-t" << opts.motion_threshold;
 
         // Optional debug marker
         if (opts.debug) {

@@ -2,7 +2,8 @@
 #include "VideoSummary.h"
 
 VideoSummary::Options::Options() :
-    threshold(0.01),
+    motion_threshold(0.1),
+    area_threshold(0.0001),
     output_fps(30),
     debug(false),
     verbose(true)
@@ -10,7 +11,6 @@ VideoSummary::Options::Options() :
 
 namespace VideoSummary {
     static const double FLOW_IMAGE_SCALE = 1 / 3.0;
-    static const double FGMASK_THRESHOLD_CONST = 8e-4;
     static const int DEBUG_HEIGHT_MULTIPLE = 3;
     static const int BUFFER_STACK_SIZE = 16 * 1024 * 1024;
     static const int BUFFER_STACK_COUNT = 6;
@@ -255,20 +255,12 @@ void VideoSummary::VideoSummaryImpl::outputWrite(cv::cuda::Stream& stream)
 void VideoSummary::VideoSummaryImpl::initThreshold()
 {
     cv::Size frame_size = input_frame.size();
-    double fgmask_area = frame_size.area() / double(FLOW_IMAGE_SCALE * FLOW_IMAGE_SCALE);
 
-    // Our real algorithmic stopping condition here is reaching a target amount of motion
-    // per frame, but in order to avoid computing optical flow on every frame we can also
-    // take an early out if the number of total foreground pixels is too low. This threshold
-    // is based on the overall motion threshold and number of pixels
-
-    fgmask_threshold = opt.threshold ? std::max<int>(1, int(
-        opt.threshold * fgmask_area * FGMASK_THRESHOLD_CONST))
-        : 0;
+    fgmask_threshold = frame_size.area() * opt.area_threshold;
 
     if (opt.verbose) {
-        std::cout << "threshold = " << opt.threshold << std::endl;
-        std::cout << "mask threshold = " << fgmask_threshold << " pixels" << std::endl;
+        std::cout << "motion threshold = " << opt.motion_threshold << std::endl;
+        std::cout << "area threshold = " << opt.area_threshold << " = " << fgmask_threshold << " pixels" << std::endl;
     }
 }
 
@@ -368,10 +360,9 @@ void VideoSummary::VideoSummaryImpl::finishMotionSum()
     double sqrsum = flowvec_sqrsum;
     assert(sqrsum >= 0.0);
 
-    double average_of_square = sqrsum / (double)flowvec_masked.size().area();
-    double scale_squared = FLOW_IMAGE_SCALE * FLOW_IMAGE_SCALE;
-    last_motion_sum = average_of_square * scale_squared;
-    assert(last_motion_sum >= 0.0);
+    double sqrarea = flowvec_masked.size().area();
+
+    last_motion_sum = sqrsum / sqrarea;
 }
 
 void VideoSummary::VideoSummaryImpl::printCurrentFrameNumbers()
@@ -443,7 +434,7 @@ void VideoSummary::VideoSummaryImpl::run(cv::cuda::Stream& stream)
                 << std::endl;
         }
 
-        if (last_motion_sum < opt.threshold) {
+        if (last_motion_sum < opt.motion_threshold) {
             // Not enough motion yet; keep this frame in the accumulator, move on.
             commitAccumulator();
             continue;
