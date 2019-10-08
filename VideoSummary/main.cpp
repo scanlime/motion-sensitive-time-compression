@@ -20,6 +20,12 @@ int main(int argc, char** argv)
         option("-r", "--fps") & value("rate", opts.output_fps) % (
             "Set the frame rate used by the output file [default = "
             + to_string(opts.output_fps) + "]"),
+        option("-W", "--width") & value("width", opts.width) % (
+            "Set the width in pixels for video processing and output [default = "
+            + to_string(opts.width) + "]"),
+        option("-H", "--height") & value("height", opts.height) % (
+            "Set the height in pixels for video processing and output [default = "
+            + to_string(opts.height) + "]"),
         option("-q", "--quiet").set(opts.verbose, false) % "Suppress normal status output",
         option("-d", "--debug").set(opts.debug) % "Generate a larger output frame that visualizes algorithm results",
         option("-y", "--overwrite").set(allow_overwrite) % "Overwrite output file if it exists",
@@ -32,6 +38,7 @@ int main(int argc, char** argv)
 
     if (!parse(argc, argv, cli) || opts.input_files.empty()) {
         cout << make_man_page(cli, "VideoSummary");
+        cout << endl << "Built on " __DATE__ " " __TIME__ << endl;
         return 1;
     }
 

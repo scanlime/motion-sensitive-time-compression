@@ -2,6 +2,8 @@
 #include "VideoSummary.h"
 
 VideoSummary::Options::Options() :
+    width(1920),
+    height(1080),
     motion_threshold(0.1),
     area_threshold(0.0001),
     output_fps(30),
@@ -128,20 +130,15 @@ void VideoSummary::VideoSummaryImpl::inputRead()
         if (!input_reader) {
             const std::string& input_file = opt.input_files[input_file_index];
             const std::string cmd = "ffmpeg -hwaccel qsv -nostats -i \"" + input_file
-                + "\" -f fifo -fifo_format rawvideo -map 0:v -vcodec rawvideo -pix_fmt rgb24 -";
+                + "\" -vf scale=" + std::to_string(opt.width) + ":" + std::to_string(opt.height)
+                + " -f fifo -fifo_format rawvideo -map 0:v -vcodec rawvideo -pix_fmt rgb24 -";
+
             std::cout << cmd << std::endl;
             input_reader = _popen(cmd.c_str(), "rb");
             setvbuf(input_reader, 0, _IONBF, 0);
             os_input_reader = INVALID_HANDLE_VALUE;
 
-            // fix me: probe resolution (and frame rate?)
-            cv::Size frame_size(1920, 1080);
-
-            if (opt.verbose) {
-                std::cout << "Input file " << input_file << " is "
-                    << frame_size.width << " x " << frame_size.height << std::endl;
-            }
-
+            cv::Size frame_size(opt.width, opt.height);
             input_frame.create(frame_size, CV_8UC3);
         }
 
@@ -191,9 +188,11 @@ void VideoSummary::VideoSummaryImpl::outputBegin()
             << std::endl;
     }
 
-    const std::string cmd = "ffmpeg -nostats -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -r 30 -video_size "
+    const std::string cmd = "ffmpeg -nostats -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -video_size "
         + std::to_string(output_size.width) + "x" + std::to_string(output_size.height)
+        + " -framerate " + std::to_string(opt.output_fps) +
         + " -i - -f fifo -map 0:v -vcodec libx264 -crf 18 \"" + opt.output_file + "\"";
+
     std::cout << cmd << std::endl;
     output_writer = _popen(cmd.c_str(), "wb");
     setvbuf(output_writer, 0, _IONBF, 0);
