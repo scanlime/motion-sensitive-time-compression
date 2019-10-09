@@ -37,8 +37,9 @@ int main(int argc, char** argv)
         );
 
     if (!parse(argc, argv, cli) || opts.input_files.empty()) {
-        cout << make_man_page(cli, "VideoSummary");
-        cout << endl << "Built on " __DATE__ " " __TIME__ << endl;
+        cout << make_man_page(cli, "vidmstc");
+        cout << endl << "vidmstc -- Video Motion Sensitive Time Compression tool" << endl;
+        cout << "Built on " __DATE__ " " __TIME__ << endl;
         return 1;
     }
 
