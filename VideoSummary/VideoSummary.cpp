@@ -191,7 +191,7 @@ void VideoSummary::VideoSummaryImpl::outputBegin()
     const std::string cmd = "ffmpeg -nostats -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -video_size "
         + std::to_string(output_size.width) + "x" + std::to_string(output_size.height)
         + " -framerate " + std::to_string(opt.output_fps) +
-        + " -i - -f fifo -map 0:v -vcodec libx264 -crf 18 \"" + opt.output_file + "\"";
+        + " -i - -f fifo -map 0:v -pix_fmt yuv420p -vcodec libx265 -crf 18 \"" + opt.output_file + "\"";
 
     std::cout << cmd << std::endl;
     output_writer = _popen(cmd.c_str(), "wb");
