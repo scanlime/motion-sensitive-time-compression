@@ -188,10 +188,13 @@ void VideoSummary::VideoSummaryImpl::outputBegin()
             << std::endl;
     }
 
-    const std::string cmd = "ffmpeg -nostats -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -video_size "
+    const std::string cmd = "ffmpeg -nostats"
+        + std::string(" -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -video_size ")
         + std::to_string(output_size.width) + "x" + std::to_string(output_size.height)
-        + " -framerate " + std::to_string(opt.output_fps) +
-        + " -i - -f fifo -map 0:v -pix_fmt yuv420p -vcodec libx265 -crf 18 \"" + opt.output_file + "\"";
+        + std::string(" -framerate ") + std::to_string(opt.output_fps)
+        + std::string(" -i - -f fifo  -f lavfi -i anullsrc -pix_fmt yuv420p -g 60 -c:v libx264 ")
+        + std::string("-c:a aac -crf 20 -bufsize 1M -maxrate 12M -hls_flags single_file -hls_list_size 0 ")
+        + "\"" + opt.output_file + "\"";
 
     std::cout << cmd << std::endl;
     output_writer = _popen(cmd.c_str(), "wb");
