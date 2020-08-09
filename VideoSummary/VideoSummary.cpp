@@ -192,8 +192,8 @@ void VideoSummary::VideoSummaryImpl::outputBegin()
         + std::string(" -f rawvideo -vcodec rawvideo -pix_fmt rgb24 -video_size ")
         + std::to_string(output_size.width) + "x" + std::to_string(output_size.height)
         + std::string(" -framerate ") + std::to_string(opt.output_fps)
-        + std::string(" -i - -f fifo  -f lavfi -i anullsrc -pix_fmt yuv420p -g 60 -c:v libx264 ")
-        + std::string("-c:a aac -crf 20 -bufsize 1M -maxrate 12M -hls_flags single_file -hls_list_size 0 ")
+        + std::string(" -i - -f fifo -pix_fmt yuv420p -g 60 -c:v libx264 ")
+        + std::string("-crf 20 -bufsize 1M -maxrate 12M -f mpegts ")
         + "\"" + opt.output_file + "\"";
 
     std::cout << cmd << std::endl;
